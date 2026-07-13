@@ -233,6 +233,96 @@ look_tic_b(unsigned char pad) {
   }
 }
 
+// Covered-terrain sprite layering: DOS re-blits misc-0x80 fg tiles over ALL
+// sprites — pole holes AND secret passages. pl_cov_mask bit (r<<2|c) = image
+// cell (col+c, row+r) covers sprites, sampled each tic by cover_scan() (fixed
+// region: MT_FLAGS needs the level bank). This bank-6 walker flips each
+// ACTIVE-frame ms_wram record's OAM priority bit by its own cell, so Keen
+// emerges from holes half-out like DOS; when EVERY record is covered,
+// pl_cov_hide skips the draw entirely (the priority bit alone still leaks
+// through the art's color-0 pixels). The previously-active frame's records
+// are restored on frame change so stale bits never show. Ledge frames live
+// in ROM (bank 26) and are skipped — hanging inside covered terrain is not
+// a shipping layout.
+static unsigned int pl_cov_mask;
+static unsigned char pl_cov_hide;
+static const unsigned char *cov_prev; // last frame walked (record state owner)
+static unsigned char cov_dirty;       // some record still carries 0x20
+__attribute__((noinline, section(".prg_rom_6.text"))) static void
+cover_pri_b(void) {
+  const unsigned char *cur;
+  unsigned char fx, fy, all = 1, any = 0;
+  unsigned char *q;
+  if (anim_frame > FRAME_POLED1) { // ledge poses: ROM records, no layering
+    pl_cov_hide = 0;
+    if (cov_dirty && cov_prev) {
+      q = (unsigned char *)cov_prev;
+      while (*q != 128) {
+        q[3] &= (unsigned char)~0x20;
+        q += 4;
+      }
+      cov_dirty = 0;
+    }
+    return;
+  }
+  cur = ms_frames_b6[anim_frame][pl_face];
+  if (cov_dirty && cov_prev != cur) { // restore the frame we left
+    q = (unsigned char *)cov_prev;
+    while (*q != 128) {
+      q[3] &= (unsigned char)~0x20;
+      q += 4;
+    }
+    cov_dirty = 0;
+  }
+  cov_prev = cur;
+  q = (unsigned char *)cur;
+  if (!pl_cov_mask) {
+    if (cov_dirty)
+      while (*q != 128) {
+        q[3] &= (unsigned char)~0x20;
+        q += 4;
+      }
+    cov_dirty = 0;
+    pl_cov_hide = 0;
+    return;
+  }
+  fx = (unsigned char)((pl_x - KEEN_CLIP_XL) >> 4) & 15u;
+  fy = (unsigned char)(pl_y >> 4) & 15u;
+  while (*q != 128) {
+    // sample the 8x16 sprite's center: +4px x, +8px y into the sprite
+    unsigned char r = (unsigned char)((fy + q[1] + 8u) >> 4);
+    unsigned char c = (unsigned char)((fx + q[0] + 4u) >> 4);
+    if (pl_cov_mask & (1u << ((r << 2) | c))) {
+      q[3] |= 0x20;
+      any = 1;
+    } else {
+      q[3] &= (unsigned char)~0x20;
+      all = 0;
+    }
+    q += 4;
+  }
+  cov_dirty = any;
+  pl_cov_hide = all;
+}
+
+// 3x3 cell scan of Keen's image window -> pl_cov_mask (bit r<<2|c). Runs in
+// the fixed region every tic: MT_FLAGS maps the level blob at $8000.
+static void cover_scan(void) {
+  unsigned char bc = (unsigned char)((pl_x - KEEN_CLIP_XL) >> 8);
+  unsigned char br = (unsigned char)(pl_y >> 8);
+  unsigned char r, c;
+  unsigned int m = 0;
+  for (r = 0; r < 3; ++r) {
+    unsigned char my = (unsigned char)(br + r);
+    if (my >= g_h)
+      break;
+    for (c = 0; c < 3; ++c)
+      if (flags_at((unsigned char)(bc + c), my) & 0x80)
+        m |= 1u << ((r << 2) | c);
+  }
+  pl_cov_mask = m;
+}
+
 void score_add(unsigned char code) {
   unsigned char life;
   set_prg_bank(6, 0x80); // the HUD/status bank (hud.c HUD_PRG_BANK)
@@ -321,6 +411,8 @@ player_init_b(void) {
   pl_pole = 0;
   pl_ledge = 0;
   pole_cd = 0;
+  pl_cov_mask = 0;
+  pl_cov_hide = 0;
   pl_gem_hit = pl_switch_hit = pl_door = 0;
   look_dir = 0;
   look_timer = 0;
@@ -463,6 +555,12 @@ static void tic(unsigned char pad) {
   }
   if (pl_pole) { // clinging to a pole: its own input handler owns this tic
     pole_tic(pad);
+    // covered-terrain sprite priority (bank 6): the walk path's banked call
+    // below is unreachable from this early return, so apply it here too
+    cover_scan();
+    set_prg_bank(6, 0x80);
+    cover_pri_b();
+    set_prg_bank(lvl_bank[g_level], 0x80);
     jump_held_prev = jump_held;
     pogo_held_prev = pogo_held;
     up_prev = pad & PAD_UP;
@@ -574,11 +672,13 @@ static void tic(unsigned char pad) {
     unsigned char i;
     unsigned int mx = (pl_x + BOX_W / 2) >> 8;
     unsigned int my = (pl_y + BOX_H) >> 8;
-    // plat/bridge switch: a switch tile at Keen's midpoint feet toggles its
-    // target (sw_n <= 4, direct scan).
+    unsigned char my0 = (unsigned char)(pl_y >> 8); // box top row
+    // plat/bridge switch: a switch tile in Keen's midpoint COLUMN, anywhere
+    // across his box rows (handles sit at body height, not underfoot),
+    // toggles its target (sw_n <= 4, direct scan).
     for (i = 0; i < sw_n; ++i) {
       const unsigned char *r = SW_REC(i);
-      if (r[0] == mx && r[1] == my) {
+      if (r[0] == mx && r[1] >= my0 && r[1] <= (unsigned char)my) {
         pl_switch_hit = (unsigned char)(i + 1);
         break;
       }
@@ -609,10 +709,13 @@ static void tic(unsigned char pad) {
   }
   up_prev = pad & PAD_UP;
 
-  // look up / look down camera peek: banked body (pure RAM logic, no
-  // map/sfx access — safe in bank 6; the fixed region is over-full)
+  // look up / look down camera peek + covered-terrain sprite priority:
+  // banked bodies (pure RAM logic, no map/sfx access — safe in bank 6; the
+  // fixed region is over-full). cover_scan needs the level bank: run first.
+  cover_scan();
   set_prg_bank(6, 0x80);
   look_tic_b(pad);
+  cover_pri_b();
   set_prg_bank(lvl_bank[g_level], 0x80);
 
   // --- X move + collision ---
@@ -622,6 +725,17 @@ static void tic(unsigned char pad) {
     unsigned char mx;
     unsigned char blocked = 0;
     unsigned char ty = y0; // also defined at the right map boundary
+    // Standing ON a slope, the feet row must not wall-scan: mid-slope the
+    // feet sit inside the slope tile's row, and a hill-crest fill tile with
+    // solid sides in that row would stop the climb (Border Village hills).
+    // The feet snap to the neighbor's higher surface on the next Y tic.
+    if (pl_on_ground && y1 > y0) {
+      unsigned char st =
+          solid_top_at((unsigned char)((pl_x + BOX_W / 2) >> 8),
+                       (unsigned char)((pl_y + BOX_H + 1) >> 8));
+      if (st > 1)
+        --y1;
+    }
     if (pl_vx > 0) {
       mx = (newx + BOX_W) >> 8;
       if (mx >= g_w)
@@ -884,10 +998,12 @@ static void tic(unsigned char pad) {
   if (pl_on_ground && !pl_gem_hit && gd_n) {
     unsigned char mx = (unsigned char)((pl_x + BOX_W / 2) >> 8);
     unsigned char my = (unsigned char)((pl_y + BOX_H) >> 8);
+    unsigned char my0 = (unsigned char)(pl_y >> 8);
     unsigned char i;
     for (i = 0; i < gd_n; ++i) {          // gd_n <= 6: direct scan (the
       const unsigned char *r = GD_REC(i); // MT_FLAG_GEMHOLD flag gate costs
-      if (r[0] == mx && r[1] == my &&     // more fixed code than it saves)
+      if (r[0] == mx &&                   // more fixed code than it saves)
+          r[1] >= my0 && r[1] <= my &&    // holders sit at body height
           (pl_keys & (unsigned char)(1u << r[2]))) {
         pl_gem_hit = (unsigned char)(i + 1);
         break;
@@ -974,23 +1090,25 @@ void player_update(unsigned char pad) {
   if (pl_ledge) {
     ; // ledge_tic_b / grab detection selected HANG or PULL1..4
   } else if (pl_pole) {
-    unsigned char moving = pad & (PAD_UP | PAD_DOWN);
-    if (anim_frame < FRAME_POLE1 || anim_frame > FRAME_POLE3) {
-      anim_frame = FRAME_POLE1;
+    if (pad & PAD_DOWN) {
+      // slide down: DOS facing-the-screen slide pose (one frame; the 1KB
+      // pole overlay page can't hold the full 3-frame slide cycle)
+      anim_frame = FRAME_POLED1;
       anim_timer = 0;
-    } else if (!moving) {
-      anim_frame = FRAME_POLE1; // DOS pole-sit pose
-      anim_timer = 0;
-    } else {
+    } else if (pad & PAD_UP) {
+      if (anim_frame < FRAME_POLE1 || anim_frame > FRAME_POLE3) {
+        anim_frame = FRAME_POLE1; // (re)enter the climb cycle (e.g. off POLED)
+        anim_timer = 0;
+      }
       ++anim_timer;
-      if (pad & PAD_DOWN)
-        ++anim_timer;
       if (anim_timer < 5u)
         return;
-      // Sliding is faster than shinnying upward, so its art cycle is too.
       anim_timer = 0;
       if (++anim_frame > FRAME_POLE3)
         anim_frame = FRAME_POLE1;
+    } else {
+      anim_frame = FRAME_POLE1; // DOS pole-sit pose
+      anim_timer = 0;
     }
   }
   else if (pl_pogo && !pl_on_ground)
@@ -1023,6 +1141,8 @@ DRAW_BANK void player_draw(unsigned int cam_px, unsigned int cam_py) {
   unsigned int img_y = (pl_y - KEEN_CLIP_YL) >> 4;
   int sx = (int)(img_x - cam_px);
   int sy = (int)(img_y - cam_py);
+  if (pl_cov_hide)
+    return; // fully behind covering terrain (hole / secret area): DOS-hidden
   if (sx < -24 || sx > 256 || sy < -32 || sy > 240)
     return;
   oam_meta_spr((unsigned char)sx, (unsigned char)sy,

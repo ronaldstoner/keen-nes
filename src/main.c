@@ -71,6 +71,9 @@ extern volatile unsigned char VRAM_INDEX;
 // the horizontal seam once the camera passes column 256.
 static unsigned int drawn_left;
 static unsigned int drawn_top; // K5 maps reach 500 vertical tile rows
+// World tile row whose seam-exit restore is deferred one frame (0xFFFF =
+// none): see the vertical seam catch-up in the main loop.
+static unsigned int seam_restore = 0xFFFFu;
 
 // ---------------------------------------------------------------------------
 // MMC5 ExRAM seam staging. The seam renderer writes nametable tile-ids
@@ -708,6 +711,7 @@ static void draw_screen_full(void) {
   MMC5_EXRAM_MODE = MMC5_EXRAM_EXATTR;
   drawn_left = left;
   drawn_top = top;
+  seam_restore = 0xFFFFu; // full redraw: no deferred seam-exit restore pending
 }
 
 // Bank-6 cold-code helpers (also re-declared with cam_bounds below; the
@@ -905,20 +909,36 @@ static void cam_bounds(void) { // fixed trampoline
 // the look up/down peek, riding the same clamped path). Shared by cam_center
 // (respawn/teleport snap) and the per-frame rate-limited follow in the main loop.
 static unsigned int cam_tx, cam_ty;
+static unsigned char cam_snap; // cam_center: center even while airborne
 // pure-WRAM (player pos + bounds -> cam target). Banked to the HUD bank (6) via
 // a trampoline to relieve the near-full fixed region (the background-animation
 // restore needed ~130B).
 MAIN_COLD static void cam_target_b(void)
 {
-  unsigned int px = pl_x >> 4, py = pl_y >> 4;
+  unsigned int px = pl_x >> 4;
   unsigned int t = (px > 124u) ? px - 124u : 0;
+  unsigned int feet;
   if (t < min_x) t = min_x;
   if (t > max_x) t = max_x;
   cam_tx = t;
-  t = (py > 112u) ? py - 112u : 0;
-  if (pl_look_off) {
-    int t2 = (int)t + pl_look_off;
-    t = (t2 < 0) ? 0 : (unsigned int)t2;
+  // Vertical: track Keen's FEET, and only while he is SUPPORTED (ground /
+  // pole / ledge; the map walker is always grounded) — jump and pogo arcs
+  // hold the camera still, with a hard push only when the feet leave the
+  // [36,172]px screen window. Feet rest at 143px from the frame top; the
+  // look peek slides that to 170 (up) / 36 (down) at 1px/tic.
+  feet = (pl_y + 496u) >> 4; // box bottom (KEEN_CLIP_YH; map keen: +31px)
+  if (cam_snap || g_on_map || pl_on_ground || pl_pole || pl_ledge) {
+    t = (feet > 143u) ? feet - 143u : 0;
+    if (pl_look_off) {
+      int t2 = (int)t + pl_look_off;
+      t = (t2 < 0) ? 0 : (unsigned int)t2;
+    }
+  } else {
+    t = cam_ty; // airborne: hold, except the push zones
+    if (feet < t + 36u)
+      t = (feet > 36u) ? feet - 36u : 0;
+    else if (feet > t + 172u)
+      t = feet - 172u;
   }
   if (t < min_y) t = min_y;
   if (t > max_y) t = max_y;
@@ -947,9 +967,12 @@ static void cam_step(void) {
   set_prg_bank(lvl_bank[g_level], 0x80);
 }
 
-// center camera on the player, clamped to the level
+// center camera on the player, clamped to the level (spawn/respawn/door cut:
+// center vertically even mid-air — the airborne hold must not pin a stale y)
 static void cam_center(void) {
+  cam_snap = 1;
   cam_target();
+  cam_snap = 0;
   cam_x = cam_tx;
   cam_y = cam_ty;
 }
@@ -1482,6 +1505,19 @@ int main(void) {
     new_left = cam_x >> 3;
     new_top = cam_y >> 3;
     seam_ntr = ntrow_of(new_top);
+    // Deferred restore of the row that left the seam on an UPWARD step (set
+    // below). The end-of-frame ExRAM blast + scroll publish can spill past
+    // vblank on vertical-seam frames; the PPU then shows one frame with the
+    // OLD Y scroll against the NEW ExRAM, and a same-frame restore of the old
+    // seam row put content lines in the top overscan band while pogoing up.
+    // Restoring one frame later keeps that row black through the mismatch
+    // window (both frames it sits inside the black overscan band). Dropped if
+    // the camera reversed and the row is the seam again (it must stay black).
+    if (seam_restore != 0xFFFFu) {
+      if (seam_restore != new_top)
+        draw_row(seam_restore);
+      seam_restore = 0xFFFFu;
+    }
     if (drawn_top < new_top) {
       ++drawn_top;
       draw_row(drawn_top + 29u);
@@ -1489,7 +1525,7 @@ int main(void) {
     } else if (drawn_top > new_top) {
       --drawn_top;
       blacken_seam_row();
-      draw_row(drawn_top + 1u);
+      seam_restore = drawn_top + 1u; // ex-seam row: restore NEXT frame
     }
     // Horizontal catch-up (drawn_left is u16: maps wider than 128 mt need it).
     while (drawn_left < new_left && VRAM_INDEX < VRAM_BUDGET) {

@@ -1,9 +1,10 @@
 # keen-nes
 
 <p align="center">
-  <img width="256" height="240" alt="keen-nes screenshot 1" src="images/1.png" />
-  <img width="256" height="240" alt="keen-nes screenshot 2" src="images/2.png" />
-  <img width="256" height="240" alt="keen-nes screenshot 3" src="images/3.png" />
+  <img width="512" height="480" alt="keen-nes screenshot 1" src="images/1.png" />
+  <img width="512" height="480" alt="keen-nes screenshot 2" src="images/2.png" />
+  <img width="512" height="480" alt="keen-nes screenshot 3" src="images/3.png" />
+  <img width="512" height="480" alt="keen-nes screenshot 4" src="images/4.png" />
 </p>
 
 An NES port of id Software's *Commander Keen* Galaxy games (episodes 4, 5 and
@@ -92,17 +93,15 @@ Generated and external directories (`assets/`, `src/gen/`, `build/`,
 Deliberate scope decisions (not bugs — noted so contributors understand the
 shape of the project):
 
-- **World map is in.** Keen 4 boots on the overworld (GAMEMAPS level 0);
-  enter playable levels from map nodes, return on exit, and fences open as
-  levels are marked done. MapKeen art, flag throw, and the ship node are
-  still polish items — see the roadmap.
 - **MMC5 mapper.** Chosen for near-lossless per-8×8 backgrounds, per-level
   sprite CHR banks, and expansion audio — at the cost of requiring a larger,
   MMC5-capable cart/emulator rather than a plain NROM/MMC3 target.
 - **Demo-scope level slice per episode.** Each episode ships a small set of
   levels bounded by the single-8 KB-bank metatile cap and CHR budget (see the
   Makefile comments). Extending coverage is a natural contribution.
-
+- **Missing animations** Some animations may be missing as a design and 
+  optimization tradeoff. 
+  
 ## Roadmap to full Keen 4 / known limitations
 
 The Keen 4 demo ships the **world map** plus **four playable stages** (ship,
@@ -119,14 +118,15 @@ Effort tags: `S` small, `M` medium, `L` large. Contributions welcome.
 
 **World map & level flow**
 
-- **World-map mode** (`done` MVP) — overworld is ROM slot `MAP_ROM_SLOT`
-  (GAMEMAPS 0); map Keen walks with FG clip; A/B on `0xC0xx` enter tiles loads
-  that level; completing a level marks it done, re-opens `0xD0xx` fences via
-  cell overrides, and returns to the saved map position. Score/lives/ammo/
-  lifewater already persist. Still missing: MapKeen walk sprites (combat
-  frames reused), flag-throw animation on `0xF0xx` holders, teleporters.
-- **Level 0 — the Bean-with-Bacon Megarocket (ship)** (`M`) — special
-  world-map node / interior once the map polish is solid.
+- **World-map mode** (`done`) — overworld is ROM slot `MAP_ROM_SLOT`
+  (GAMEMAPS 0); map Keen walks with FG clip using dedicated 8-direction ×
+  3-frame MapKeen sprites; A/B on `0xC0xx` enter tiles loads that level;
+  completing a level marks it done, re-opens `0xD0xx` fences via cell
+  overrides, plants a static flag on the `0xF0xx` holder, and returns to the
+  saved map position. Score/lives/ammo/lifewater persist across levels. The
+  ship (BWB Megarocket) is a playable, always re-enterable map node.
+  Remaining polish: the flag-throw animation on level completion (flags
+  currently appear planted, no arc), and map teleporters (Keen 5/6 only).
 - **Full episode level set on the map** (`L`) — depends on the metatile-cap
   raise; the demo still packs only a small playable subset (see Makefile).
 
@@ -142,23 +142,27 @@ Effort tags: `S` small, `M` medium, `L` large. Contributions welcome.
 - **Moving / "surfing" platforms** (`M`) — data is already emitted (`plats` with
   a signed dir, `fplats`); finish the ride-on actor. (Supersedes the old
   "lifters need work" note.)
-- **Gem/keygem doors + blocks** (`M`) — `doors`/`blocks` data and the `pl_keys`
-  bitmask already exist; finish the open-door / consume-key logic.
+- **Gem/keygem doors + switches** (`done`) — gem holders consume the matching
+  `pl_keys` gem and open the door via cell overrides; switches toggle on an
+  Up-press; in-level door transitions fade Keen out and cut to the
+  destination.
 
 **Full bestiary**
 
 - **Generalize the actor system** (`L`) — `src/actors.c` hardcodes three enemy
   slots per episode (`#if EPISODE`). Refactor to a type-tagged behavior table so
   enemies are pluggable and levels declare their own mix. Unblocks the below.
-- **One enemy per contribution** (`M` each) — the remaining Keen 4 bestiary
-  (Dopefish, Arachnut, Berkeloid, Bounder, Wormouth, Skypest, Inchworm, Foot,
-  Schoolfish, Sprite, …). The per-level sprite-CHR-bank design already scopes art
-  to the enemies a level actually uses, so this parallelizes cleanly.
+- **One enemy per contribution** (`M` each) — implemented so far: Poison Slug,
+  Lick, Mad Mushroom, Skypest, Bounder, Wormouth, Mimrock. Remaining Keen 4
+  bestiary: Dopefish, Arachnut, Berkeloid, Inchworm, Foot, Schoolfish, Sprite,
+  Lindsey, … The per-level sprite-CHR-bank design already scopes art to the
+  enemies a level actually uses, so this parallelizes cleanly.
 
 **Juice & polish**
 
-- **Player idle + pose animations** (`S`) — idle blink/foot-tap; wire the
-  half-stubbed LOOKU/LOOKD/DEATH frames (`src/player.c`).
+- **Player idle animations** (`S`) — idle blink/foot-tap. (LOOKU/LOOKD/DEATH
+  poses are wired: look up/down pans the camera, and the death arc plays with
+  its own art.)
 - **More background effects** (`S/M`) — additional TILEINFO anim chains; swim /
   wetsuit (untested); pole-climb polish.
 - **Palette bugs** (`M`) — some converted palettes render incorrectly
@@ -169,7 +173,7 @@ Effort tags: `S` small, `M` medium, `L` large. Contributions welcome.
 - **Remove remaining PC-era idioms** (`S`) — the port still carries DOS 16-bit
   assumptions in places that should be 8-bit on the 6502.
 
-**Critical path:** cap raise → more levels on the map → ship + Council Members +
+**Critical path:** cap raise → more levels on the map → Council Members +
 ending yields a structurally complete game loop (map → levels → rescue → win)
 even before the full bestiary; then the actor-system refactor and per-enemy work
 is the long tail a community chews through in parallel.

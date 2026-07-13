@@ -193,11 +193,14 @@ class TileSource:
                 data, 2, 16, nplanes=5, mask_first=True)
         return self.t16m[t]
 
-    def composite(self, bg_t, fg_t, item_chunk=0):
-        """16x16 EGA-index grid of fg (and optional item) over bg."""
+    def composite(self, bg_t, fg_t, item_chunk=0, fg_over_item=False):
+        """16x16 EGA-index grid of fg (and optional item) over bg.
+        fg_over_item: the fg tile draws over sprites in DOS (TILEINFO misc
+        bit 0x80), so the item sprite bakes UNDER it (hidden items)."""
         base = self.bg_tile(bg_t)
         cell = [row[:] for row in base] if base else [[0] * 16 for _ in range(16)]
-        if fg_t:
+
+        def blit_fg():
             f = self.fg_tile(fg_t)
             if f:
                 idx, mask = f
@@ -205,12 +208,22 @@ class TileSource:
                     for x in range(16):
                         if not mask[y][x]:
                             cell[y][x] = idx[y][x]
-        if item_chunk:
+
+        def blit_item():
             grid, mask = self.sprite_ega(item_chunk)
             for y in range(16):
                 for x in range(16):
                     if not mask[y][x]:
                         cell[y][x] = grid[y][x]
+
+        if fg_t and item_chunk and fg_over_item:
+            blit_item()
+            blit_fg()
+        else:
+            if fg_t:
+                blit_fg()
+            if item_chunk:
+                blit_item()
         return cell
 
 

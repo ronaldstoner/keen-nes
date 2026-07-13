@@ -47,7 +47,9 @@ if K.EP == 6:
     LOOK_FRAMES = {"LOOKU": 68, "LOOKD1": 81, "LOOKD2": 82}
     DEATH_FRAMES = {"DEATH": 83}
     # pole-climb, ledge-hang, and ledge-pull frames; left variants use hardware X-flip.
-    POLE_FRAMES = {"POLE1": 102, "POLE2": 103, "POLE3": 104}
+    # POLED aliases the climb frames until the K6 slide chunks are verified.
+    POLE_FRAMES = {"POLE1": 102, "POLE2": 103, "POLE3": 104,
+                   "POLED1": 102}
     LEDGE_FRAMES = {"HANG": 124, "PULL1": 129, "PULL2": 130,
                     "PULL3": 131, "PULL4": 132}
     SHOT_FRAMES = {"STUN1": 96, "STUN2": 97, "STUNHIT1": 100}
@@ -77,7 +79,9 @@ elif K.EP == 5:  # Keen 5 (retail v1.4)
     LOOK_FRAMES = {"LOOKU": 124, "LOOKD1": 137, "LOOKD2": 138}
     DEATH_FRAMES = {"DEATH": 140}  # boink launch pose
     # pole-climb, ledge-hang, and ledge-pull frames; left variants use hardware X-flip.
-    POLE_FRAMES = {"POLE1": 159, "POLE2": 160, "POLE3": 161}
+    # POLED aliases the climb frames until the K5 slide chunks are verified.
+    POLE_FRAMES = {"POLE1": 159, "POLE2": 160, "POLE3": 161,
+                   "POLED1": 159}
     LEDGE_FRAMES = {"HANG": 181, "PULL1": 186, "PULL2": 187,
                     "PULL3": 188, "PULL4": 189}
     SHOT_FRAMES = {"STUN1": 153, "STUN2": 154, "STUNHIT1": 157}
@@ -107,8 +111,12 @@ else:  # Keen 4 (shareware v1.4)
     }
     LOOK_FRAMES = {"LOOKU": 146, "LOOKD1": 160, "LOOKD2": 161}
     DEATH_FRAMES = {"DEATH": 162}  # boink launch pose
-    # pole-climb frames; left variants use hardware X-flip.
-    POLE_FRAMES = {"POLE1": 180, "POLE2": 181, "POLE3": 182}
+    # pole-climb + pole-slide-down frames; left variants use hardware X-flip.
+    # 183-185 = Keen facing the screen sliding down (DOS pole-down anim); the
+    # 1KB pole overlay page can't hold all three on top of the climb frames
+    # (41 > 32 replaceable pairs), so the middle pose serves the whole slide.
+    POLE_FRAMES = {"POLE1": 180, "POLE2": 181, "POLE3": 182,
+                   "POLED1": 184}
     LEDGE_FRAMES = {"HANG": 202, "PULL1": 207, "PULL2": 208,
                     "PULL3": 209, "PULL4": 210}
     SHOT_FRAMES = {"STUN1": 174, "STUN2": 175, "STUNHIT1": 178}
@@ -541,7 +549,8 @@ def main():
     # default before level_load overwrites ms_wram with the per-level image.
     POSE_FALLBACK = {"LOOKU": "STAND", "LOOKD1": "STAND", "LOOKD2": "STAND",
                      "DEATH": "JUMP1", "POLE1": "STAND", "POLE2": "STAND",
-                     "POLE3": "STAND", "HANG": "STAND", "PULL1": "STAND",
+                     "POLE3": "STAND", "POLED1": "STAND",
+                     "HANG": "STAND", "PULL1": "STAND",
                      "PULL2": "STAND", "PULL3": "STAND", "PULL4": "STAND"}
 
     def slot_ints(name, flip):
@@ -579,7 +588,15 @@ def main():
     order = ["STAND", "RUN1", "RUN2", "RUN3", "RUN4", "JUMP1", "JUMP2",
              "JUMP3", "POGO1", "POGO2",
              "LOOKU", "LOOKD1", "LOOKD2", "DEATH",
-             "POLE1", "POLE2", "POLE3"]
+             "POLE1", "POLE2", "POLE3", "POLED1"]
+    for o in order:
+        lines.append(f"  {{ ms_{o}_R, ms_{o}_L }},\n")
+    lines.append("};\n")
+    # Bank-6 mirror of ms_frames: the covered-terrain sprite-priority walker
+    # (player.c cover_pri_b) runs from bank 6 and needs the active frame's
+    # ms_wram record pointer without mapping draw bank 26.
+    lines.append('__attribute__((used, section(".prg_rom_6")))'
+                 " const unsigned char *const ms_frames_b6[][2] = {\n")
     for o in order:
         lines.append(f"  {{ ms_{o}_R, ms_{o}_L }},\n")
     lines.append("};\n")
@@ -898,12 +915,20 @@ def main():
     hdr = ["#ifndef PLAYER_H\n#define PLAYER_H\n"]
     hdr.append(f"#define MS_WRAM_LEN {off}\n")
     hdr.append("extern unsigned char ms_wram[];\n")
+    # Contiguous ms_wram range of the pole frames (POLE1..POLED1, R+L): the
+    # pole-hole layering flips these records' OAM priority bit in place.
+    # Slot padding is 128s, so a walker can skip terminator/pad bytes.
+    _p0 = slot_layout["ms_POLE1_R"][0]
+    _pe = slot_layout["ms_POLED1_L"]
+    hdr.append(f"#define MS_POLE_PRI_OFF {_p0}\n")
+    hdr.append(f"#define MS_POLE_PRI_END {_pe[0] + _pe[1]}\n")
     for i, o in enumerate(order):
         hdr.append(f"#define FRAME_{o} {i}\n")
     for i, o in enumerate(("HANG", "PULL1", "PULL2", "PULL3", "PULL4"),
                           start=len(order)):
         hdr.append(f"#define FRAME_{o} {i}\n")
     hdr.append("extern const unsigned char *const ms_frames[][2];\n")
+    hdr.append("extern const unsigned char *const ms_frames_b6[][2];\n")
     hdr.append("extern const unsigned char *const ms_ledge[][2];\n")
     hdr.append("extern const unsigned char *const ms_bloog[][2];\n")
     hdr.append("extern const unsigned char *const ms_bloogstun;\n")

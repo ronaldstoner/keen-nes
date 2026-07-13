@@ -204,7 +204,8 @@ def pack_level_sprite_pairs(mani, tags):
             obank[new * 2 + 1] = pair[16:]
         return b"".join(obank[page * 64:(page + 1) * 64]), omap
 
-    pole_page, pole_mapping = build_overlay(("POLE1", "POLE2", "POLE3"))
+    pole_page, pole_mapping = build_overlay(
+        ("POLE1", "POLE2", "POLE3", "POLED1"))
     ledge_page, ledge_mapping = build_overlay(
         ("HANG", "PULL1", "PULL2", "PULL3", "PULL4"))
 

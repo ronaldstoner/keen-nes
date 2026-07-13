@@ -119,7 +119,10 @@ def build_cells(n, ts):
                           (bg[i], 0, 0)))
         key = (bg[i], fg[i], item_chunk)
         if key not in cells:
-            cells[key] = ts.composite(*key)
+            # DOS draws misc-0x80 fg tiles over sprites: bake the item UNDER
+            # such fg art so hidden items stay hidden until collected.
+            cells[key] = ts.composite(
+                *key, fg_over_item=bool(fg[i] and (ti0.misc(fg[i]) & 0x80)))
         # camera clamps 2 tiles inside the border ring -> ring cells weightless
         x, y = i % w, i // w
         usage[key] += 1 if 2 <= x <= w - 3 and 2 <= y <= h - 3 else 0
@@ -176,15 +179,18 @@ def build_cells(n, ts):
             return (0, 0)
         # flags: bit0 right-solid, bit1 bottom-solid, bit2 left-solid,
         # bit3 deadly (misc==3), bit4 POLE/climbable (misc==1), bit5 GEMHOLDER
-        # (misc 7..10), bit6 SWITCH (misc 5/6/15). The holder/switch bits gate
-        # player.c's per-tic gem-place / Up-press-switch scans.
+        # (misc 7..10), bit6 SWITCH (misc 5/6/15), bit7 FG-over-sprites (DOS
+        # misc 0x80: pole holes etc. — player.c flips Keen's OAM priority on
+        # poles). The holder/switch bits gate player.c's per-tic gem-place /
+        # Up-press-switch scans.
         m = ti0.misc(f) & 0x7F
         return (ti0.top(f),
                 (1 if ti0.right(f) else 0) | (2 if ti0.bottom(f) else 0)
                 | (4 if ti0.left(f) else 0) | (8 if ti0.misc(f) == 3 else 0)
                 | (0x10 if m == 1 else 0)
                 | (0x20 if 7 <= m <= 10 else 0)
-                | (0x40 if m in (5, 6, 15) else 0))
+                | (0x40 if m in (5, 6, 15) else 0)
+                | (0x80 if (ti0.misc(f) & 0x80) else 0))
 
     return dict(meta=meta, w=w, h=h, bg=bg, fg=fg, info=info,
                 cells=cells, usage=usage, cellmap=cellmap, items=items,
@@ -276,7 +282,7 @@ def collect_map_nodes(w, bg, info):
     return enters, fences, flags
 
 
-def build_entities(n, w, h, info):
+def build_entities(n, w, h, info, fg):
     """Episode-aware enemy/platform tables from the Galaxy info plane.
 
     The three runtime enemy slots are deliberately generic: walker, secondary
@@ -288,6 +294,7 @@ def build_entities(n, w, h, info):
     """
     if n == 0:
         return [], [], [], [], [], [], []
+    ti_doors = KL.TileInfo()
 
     def cells_of(pred):
         return [(i % w, i // w, v) for i, v in enumerate(info) if pred(v)]
@@ -325,7 +332,16 @@ def build_entities(n, w, h, info):
         plats += [(x, y, v - 84) for x, y, v in cells_of(lambda v: 84 <= v <= 87)]
     fplats = [(x, y) for x, y, v in cells_of(lambda v: v == 32)]
     blocks = [(x, y) for x, y, v in cells_of(lambda v: v == 31)]
-    doors = [(x, y, v >> 8, v & 0xFF) for x, y, v in cells_of(lambda v: v > 0x100)]
+    # A door is identified by its FG tile's misc code (2 = door; 32 = K5
+    # security door); the info value is only its destination. Matching on
+    # info > 0x100 alone also swallowed gem holders and switches (their info
+    # is the target cell) — Up then teleported Keen instead of activating.
+    def is_door(i):
+        f = fg[i]
+        return f and (ti_doors.misc(f) & 0x7F) in (2, 32)
+    doors = [(x, y, v >> 8, v & 0xFF)
+             for x, y, v in cells_of(lambda v: v > 0x100)
+             if is_door(y * w + x)]
     for tbl in (bloogs, blets, babs, plats, fplats, blocks, doors):
         tbl.sort(key=lambda e: e[0])
     return bloogs, blets, babs, plats, fplats, blocks, doors
@@ -771,7 +787,7 @@ def emit_level(n, ts):
 
     # --- entity tables ---
     bloogs, blets, babs, plats, fplats, blocks, doors = build_entities(
-        n, w, h, d["info"])
+        n, w, h, d["info"], d["fg"])
     # items: x,y,type,empty_mt(u16) -- empty_mt widened to u16 (u16 mt space);
     # the reverted-to empty metatile is the one baked for the item's own span.
     item_recs = sorted(((x, y, t, mt_key_lut[(ekey, span_of_col(x, cuts))])
