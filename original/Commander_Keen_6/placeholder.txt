@@ -1,0 +1,11 @@
+Place your own Commander Keen 6 DOS game file in this folder:
+
+    keen6.exe       (Keen 6 "Aliens Ate My Babysitter", v1.4/v1.5 EGA)
+
+This project ships NO game assets. You must supply your own copy of the
+original game; the build extracts and converts it locally. See the top-level
+README for details.
+
+This placeholder only exists so the build finds the expected folder. It is
+safe to leave here. Please do NOT commit real game files — they are
+copyrighted by id Software.

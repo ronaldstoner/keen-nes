@@ -1,0 +1,11 @@
+Place your own Commander Keen 5 DOS game file in this folder:
+
+    KEEN5E.EXE      (Keen 5 "The Armageddon Machine", v1.4 EGA)
+
+This project ships NO game assets. You must supply your own copy of the
+original game; the build extracts and converts it locally. See the top-level
+README for details.
+
+This placeholder only exists so the build finds the expected folder. It is
+safe to leave here. Please do NOT commit real game files — they are
+copyrighted by id Software.

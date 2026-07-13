@@ -1,0 +1,21 @@
+Extract your own copy of Commander Keen 4 (DOS) into this folder.
+
+Copy the ENTIRE game directory here, not just the EXE. At minimum the build
+needs these files (case-insensitive):
+
+    KEEN4E.EXE      (Keen 4 "Secret of the Oracle", v1.4 EGA) - unpacked by the
+                     build to recover its embedded graphics/audio header tables
+    EGAGRAPH.CK4    graphics: tiles, sprites, bitmaps   (required)
+    GAMEMAPS.CK4    level maps                           (required)
+    AUDIO.CK4       music + sound effects                (required)
+
+Supplying only the EXE will fail at the extract step ("egagraph.ck4 ... not
+found"). Copying the whole directory is the safe option.
+
+This project ships NO game assets. You must supply your own copy of the
+original game; the build extracts and converts it locally. See the top-level
+README for details.
+
+This placeholder only exists so the build finds the expected folder. It is
+safe to leave here. Please do NOT commit real game files - they are
+copyrighted by id Software.

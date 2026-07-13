@@ -1,0 +1,33 @@
+# --- Original game files (copyrighted by id Software; NEVER commit). Ignore
+# everything you drop into the episode folders, but keep the placeholders. ---
+/original/*/*
+!/original/*/placeholder.txt
+
+# --- Toolchains / third-party code fetched locally (see README) ---
+# llvm-mos, unlzexe, and an emulator live here.
+/third_party/
+
+# --- Extracted / converted assets (derived from your game files) ---
+/assets/
+
+# --- Generated source (emitted by tools/ during the build) ---
+/src/gen/
+/src/mmc5/gen_mmc5_data.c
+
+# --- Build outputs ---
+/build/
+
+# --- Python ---
+/.venv/
+__pycache__/
+*.pyc
+
+# --- Local scratch / captures / media ---
+/scratchpad/
+
+# --- Internal docs (kept local, not published) ---
+/docs/
+
+# --- OS / editor cruft ---
+.DS_Store
+*.zip
