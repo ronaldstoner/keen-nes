@@ -9,6 +9,7 @@
 #include <string.h>
 #include "level_fmt.h"
 #include "gen/levels.h"
+#include "mmc5/mmc5.h"
 
 // ===========================================================================
 // MMC5 EXRAM level reader.
@@ -43,6 +44,8 @@ extern const unsigned char lvl_bank[];
 // per-level sprite CHR bank (1KB units) + metasprite image (bank + $8000 ptr);
 // gen_mmc5_rom packs each level's Keen+enemies (+poses where they fit) into
 // its own sprite bank and a matching ms_wram image.
+// 1KB CHR page indices relative to SPR_PAGE_BASE (levels.h). Absolute page =
+// SPR_PAGE_BASE + rel may exceed 255; written via $5130 + $5120..$5127.
 extern const unsigned char lvl_spr_pages[][8];
 extern const unsigned char lvl_pole_page[];
 extern const unsigned char lvl_ledge_page[];
@@ -63,13 +66,20 @@ static const unsigned char *mt_top_p, *mt_flags_p;
 #if EPISODE == 5
 static unsigned int rows_off[256];       // Korath III Base is 250 rows
 #else
-static unsigned int rows_off[128];       // K4/K6 demo maps are below 128 rows
+// K4 demo tallest map is Perilous Pit h=84; 96 leaves headroom. (Was 128 —
+// every WRAM byte counts: soft stack sits at the top of $6000-$7FFF.)
+static unsigned int rows_off[96];
 #endif
 // MMC5 seam fast path: the first 8*N bytes are interleaved render records
 // {4 tile ids, 4 ExRAM attrs}; top[N],flags[N] follow. gen_mmc5_rom aligns the
 // whole 10*N table to one bank. One m<<3 locates a render record.
 unsigned char mt_bank;
-#define MMC5_ENT_ARENA 1632
+// Entity tables for the demo slice (max ~666B on Slug Village). Full-game L4
+// needs ~1.5KB; keep room for growth without eating the soft stack. Soft stack
+// grows down from $7FFF into PRG-RAM — if BSS fills to the top, nested C frames
+// stomp ms_wram (bounder/worm metasprites live at the end) → missing enemies,
+// ghost deaths, freezes on item pickup.
+#define MMC5_ENT_ARENA 896
 static unsigned char ent_arena[MMC5_ENT_ARENA]; // WRAM entity tables
 static const unsigned char ent_rec[8] = {5, 3, 4, 3, 3, 2, 2, 4};
 
@@ -189,13 +199,28 @@ void map_row_read16(unsigned char mx, unsigned char my, unsigned char n,
 
 void level_load(unsigned char n) {
   const unsigned char *B;
+  const unsigned char *ms_src;
+  unsigned char ms_bnk;
   unsigned int off_rows, off_mt, off_pal, N, fb, arena;
   unsigned char i;
 
   g_level = n;
   base_bank = lvl_bank[n];
+
+  // Cold level tables live in bank 6 — snapshot before mapping the level blob.
+  M5_PRG0 = 0x86;
+  for (i = 0; i < 8; ++i)
+    spr_pages[i] = lvl_spr_pages[n][i];
+  pole_page = lvl_pole_page[n];
+  ledge_page = lvl_ledge_page[n];
+  overlay_slot = lvl_overlay_slot[n];
+  ms_bnk = lvl_ms_bank[n];
+  ms_src = lvl_ms_ref[n];
+  B = lvl_blob_refs[base_bank];
+
+  // Level blob at $8000
   M5_PRG0 = 0x80 | base_bank;
-  B = lvl_blob_refs[base_bank];          // $8000; anchors the bank sections
+  // B still points at the blob's $8000 window (same address, new bank).
 
   g_w = B[MMC5_OFF_W];
   g_h = B[MMC5_OFF_H];
@@ -215,9 +240,10 @@ void level_load(unsigned char n) {
   // window pointers into mt_bank (off_mt is bank-aligned -> fb & 0x1FFF = 8N)
   mt_top_p = (const unsigned char *)(0x8000u + (fb & 0x1FFFu));       // top[N]
   mt_flags_p = mt_top_p + N;                                          // flags[N]
-  // MT is bank-aligned (gen_mmc5_rom.realign_mt): whole table in one bank.
-  mt_bank = (unsigned char)(0x80u | base_bank |
-                            (unsigned char)(off_mt >> 13));
+  // MT bank-aligned (realign_mt): one bank. Use add, not OR, for spill
+  // (base|1 can equal base when base is odd — wrong window, bad collision/CHR).
+  mt_bank = (unsigned char)(0x80u |
+                            (base_bank + (unsigned char)(off_mt >> 13)));
   for (i = 0; i < g_h; ++i)              // ROWS[] (h x u16) -> WRAM, off_map
     rows_off[i] = off_map + rd16(off_rows + ((unsigned int)i << 1)); // folded in
   for (i = 0; i < 16; ++i)              // palette set 0 -> WRAM
@@ -231,17 +257,22 @@ void level_load(unsigned char n) {
     unsigned int eoff = rd16(dir);       // u32 off, low 16 (blob < 64KB)
     unsigned int cnt = rd16(dir + 4);
     unsigned char rec = ent_rec[i], r;
+    unsigned int got = 0;
     g_ent[i] = ent_arena + arena;
-    if (i == 0)
-      g_nitems = cnt;
-    g_nent[i] = (unsigned char)cnt;
-    while (cnt--)
+    while (got < cnt) {
+      // Clamp: a too-small arena must not wrap into ms_wram / soft stack.
+      if (arena + rec > MMC5_ENT_ARENA)
+        break;
       for (r = 0; r < rec; ++r)
         ent_arena[arena++] = rd8(eoff++);
+      ++got;
+    }
+    if (i == 0)
+      g_nitems = got;
+    g_nent[i] = (unsigned char)got;
   }
 
   // gem-door + switch extension (header byte 38 = u16 blob offset; 0 = none).
-  // Copy the raw section bytes; the level_fmt.h macros index them.
   gd_n = sw_n = 0;
   sw_base = ext_raw + 2;
   {
@@ -250,33 +281,21 @@ void level_load(unsigned char n) {
       unsigned char j;
       gd_n = rd8(e);
       sw_n = rd8(e + 1);
-      for (j = 0; j < EXT_RAW_MAX; ++j)   // fixed copy (unused tail is inert)
+      for (j = 0; j < EXT_RAW_MAX; ++j)
         ext_raw[j] = rd8(e + j);
       sw_base = ext_raw + 2 + (unsigned int)gd_n * 10u;
     }
   }
 
-  // PER-LEVEL sprite CHR + metasprites: copy this level's ms_wram image (from
-  // its own PRG bank) into always-mapped WRAM, then point set A ($5124-$5127)
-  // at the level's 4KB sprite bank. The image's tile ids match that bank, so
-  // Keen's LOOK/DEATH poses appear wherever the level's enemy set left room;
-  // dense levels keep the STAND/JUMP fallback baked into the image.
+  // Per-level metasprite image -> WRAM (ms bank was snapshotted above).
   {
-    const unsigned char *src = lvl_ms_ref[n];
     unsigned int j;
-    M5_PRG0 = 0x80 | lvl_ms_bank[n];       // map the ms image bank at $8000
+    M5_PRG0 = 0x80 | ms_bnk;
     for (j = 0; j < SPR_MS_LEN; ++j)
-      ms_wram[j] = src[j];
-    M5_PRG0 = 0x80 | base_bank;            // restore the level blob bank
+      ms_wram[j] = ms_src[j];
+    M5_PRG0 = 0x80 | base_bank;
   }
-  for (i = 0; i < 8; ++i)
-    spr_pages[i] = lvl_spr_pages[n][i];
-  pole_page = lvl_pole_page[n];
-  ledge_page = lvl_ledge_page[n];
-  overlay_slot = lvl_overlay_slot[n];
-  // CHR: sprites on set A ($5124-$5127 via the compat shim); bg is per-cell
-  // via ExRAM (main.c). $5130 upper bits = 0 (all bg banks < 64).
-  MMC5_CHR_UPPER = CHR_UPPER;
+  // CHR: sprites on set A; bg per-cell via ExRAM. $5130 in level_chr_refresh_b.
   level_chr_refresh();
   g_region = 0;
 }
@@ -300,8 +319,12 @@ level_chr_refresh_b(void) {
                                         // set here (bank 6) so the fixed region
                                         // pays nothing. present_screen runs this
                                         // on load/respawn/door/gem/status-close.
-  for (i = 0; i < 8; ++i)
-    ((volatile unsigned char *)0x5120)[i] = spr_pages[i];
+  // Absolute 1KB page = SPR_PAGE_BASE + relative; $5130 holds upper bits.
+  for (i = 0; i < 8; ++i) {
+    unsigned int page = (unsigned int)SPR_PAGE_BASE + spr_pages[i];
+    MMC5_CHR_UPPER = (unsigned char)((page >> 8) & 3u);
+    ((volatile unsigned char *)0x5120)[i] = (unsigned char)page;
+  }
 }
 void level_chr_refresh(void) {
   set_prg_bank(6, 0x80);
@@ -318,9 +341,12 @@ void level_chr_refresh(void) {
 // uploads, and no enemy-animation cuts.
 __attribute__((noinline, section(".prg_rom_6.text"))) static void
 level_chr_overlay_b(void) {
-  ((volatile unsigned char *)0x5120)[overlay_slot] =
+  unsigned char rel =
       chr_overlay == 1 ? pole_page : chr_overlay == 2 ? ledge_page
-                                                    : spr_pages[overlay_slot];
+                                                     : spr_pages[overlay_slot];
+  unsigned int page = (unsigned int)SPR_PAGE_BASE + rel;
+  MMC5_CHR_UPPER = (unsigned char)((page >> 8) & 3u);
+  ((volatile unsigned char *)0x5120)[overlay_slot] = (unsigned char)page;
 }
 void level_chr_overlay(unsigned char kind) {
   if (kind == chr_overlay)

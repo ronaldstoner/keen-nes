@@ -24,7 +24,7 @@ third_party/unlzexe/unlzexe: third_party/unlzexe/unlzexe.c
 # use the normal generated data. mmc5_compat.c maps the engine's PRG/CHR bank
 # calls to MMC5 registers (see its header for why the shim stays). ---
 KEEN4_SRCS := src/mmc5/reset_keen.s src/exram_blast.s src/music_sync.s src/seam_decode.s src/mmc5/mmc5_compat.c src/main.c src/player.c \
-        src/actors.c src/sfx.c src/hud.c src/level.c src/music.c \
+        src/actors.c src/sfx.c src/hud.c src/level.c src/music.c src/map.c \
         src/gen/musicdata.c src/title.c src/gen/leveldata_mmc5.c \
         src/gen/titledata.c src/gen/player.c src/gen/sfx.c
 KEEN4_CFLAGS := -Oz -Tsrc/mmc5.ld -lneslib -lnesdoug
@@ -46,11 +46,14 @@ build/keen4.nes: third_party/unlzexe/unlzexe
 	  KEEN_EP=4 $(PY) tools/extract_assets.py; fi
 	# Blob v2 uses renderer-ready metatile records. Regenerate deterministically
 	# so a stale v1 converted asset can never be linked with the v2 reader.
-	KEEN_EP=4 $(PY) tools/gen_mmc5_level.py 1 3
+	# Demo slice (not full game): world map + 4 playable stages.
+	# 0 = Shadowlands (overworld), 18 = BWB Megarocket (ship),
+	# 1 = Border Village, 2 = Reclamation (Slug Village), 3 = Perilous Pit.
+	KEEN_EP=4 $(PY) tools/gen_mmc5_level.py 0 18 1 2 3
 	KEEN_EP=4 $(PY) tools/gen_player_data.py
-	KEEN_EP=4 $(PY) tools/gen_mmc5_rom.py 1 3
+	KEEN_EP=4 $(PY) tools/gen_mmc5_rom.py 0 18 1 2 3
 	KEEN_EP=4 $(PY) tools/gen_sfx.py
-	KEEN_EP=4 $(PY) tools/gen_music.py 1 3
+	KEEN_EP=4 $(PY) tools/gen_music.py 0 18 1 2 3
 	KEEN_EP=4 $(PY) tools/gen_mmc5_title.py
 	KEEN_EP=4 $(PY) tools/gen_status.py
 	$(CC) $(KEEN4_CFLAGS) -o $@ $(KEEN4_SRCS) -Wl,-Map=build/keen4.map

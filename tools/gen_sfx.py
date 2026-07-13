@@ -20,19 +20,17 @@ AUD = ROOT / f"assets/extracted/ck{EP}/audio"
 GEN = ROOT / "src/gen"
 GEN.mkdir(parents=True, exist_ok=True)
 
-# sound number -> C name. Numbers are the game's own SOUND_* audio IDs.
+# PC audio chunk id -> C name. Only SFX the engine actually triggers.
 SOUNDS = {
     2: "JUMP", 3: "LAND", 4: "SHOOT", 7: "POGO", 8: "ITEM",
-    9: "AMMO",          # SOUND_GOTSTUNNER (ammo pickup)
-    13: "LEVELDONE",    # SOUND_LEVELEXIT (level complete)
-    14: "KEYCARD",      # SOUND_NEEDKEYCARD (locked security door)
+    9: "AMMO",          # stunner ammo pickup
+    12: "MAPENTER",     # map node enter
+    13: "LEVELDONE",    # level exit / complete
+    14: "KEYCARD",      # locked security door
     17: "EXTRALIFE", 18: "OPENGEMDOOR", 19: "GEM", 21: "NOAMMO",
     23: "DIE", 25: "SHOTHIT",
 }
-# Only sounds actually triggered are included (each costs SFX-bank space).
-# Enemy sounds (WORMMOUTHBITE 5, MUSHROOMLEAP 16, SKYPESTSQUISH 22 ...) are
-# omitted: the constant ones would keep interrupting the pulse-2 music channel.
-# keen4 has no flagpole so SOUND_FLAGFLIP 43 doesn't apply.
+# Enemy hits are omitted — they would keep stealing pulse-2 from music.
 
 PIT_CLOCK = 1193182
 NES_CLOCK = 1789773

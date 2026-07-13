@@ -105,6 +105,8 @@ def pack_level_sprite_pairs(mani, tags):
         if nm in active_real_pose:
             return real[nm]
         off, ln = slots[nm]
+        if off < 0:  # banked-only (map Keen / flag): real global-id template
+            return real.get(nm, [128])
         return ms0[off:off + ln]
 
     active_core = [nm for nm in slots
@@ -210,7 +212,23 @@ def pack_level_sprite_pairs(mani, tags):
         return 2 * i + 1 if i < 128 else 2 * (i - 128)
 
     ms = list(ms0)
+    mapkeen_ms = {}
     for nm, (off, ln) in slots.items():
+        if off < 0:
+            # Map Keen banked-only: remap into bank-26 tables
+            if kinds.get(nm) not in tags and "mapkeen" not in tags:
+                continue
+            src = real.get(nm) or content(nm)
+            if not src:
+                continue
+            out, i = [], 0
+            while i < len(src) and src[i] != 128:
+                dx, dy, tid, at = src[i:i + 4]
+                out += [dx, dy, oam(mapping[tid]), at]
+                i += 4
+            out.append(128)
+            mapkeen_ms[nm] = bytes(v & 0xFF for v in out)
+            continue
         if nm not in active:
             ms[off:off + ln] = [128] * ln
             continue
@@ -239,7 +257,7 @@ def pack_level_sprite_pairs(mani, tags):
             out.append(128)
             ledge_ms[nm] = bytes(v & 0xFF for v in out)
     return (b"".join(bank_a) + b"".join(bank_b),
-            pole_page, ledge_page, 4 + page, ms, ledge_ms, len(mapping),
+            pole_page, ledge_page, 4 + page, ms, ledge_ms, mapkeen_ms, len(mapping),
             sorted(nm for nm in active_real_pose if nm.endswith("_R")))
 
 
@@ -354,10 +372,14 @@ def main():
             page_lut[p] = len(chr_all) // 1024
             chr_all.extend(p)
         return page_lut[p]
+    mapkeen_ms_best = {}
     for lv in per_level:
         tags = level_enemy_tags(lv["blob"])
-        spr_chr, pole_chr, ledge_chr, overlay_slot, ms, ledge_ms, used_pairs, poses = \
-            pack_level_sprite_pairs(mani, tags)
+        # World map (GAMEMAPS 0): pack map Keen (+ flag), not combat bestiary.
+        if lv["n"] == 0:
+            tags.add("mapkeen")
+        (spr_chr, pole_chr, ledge_chr, overlay_slot, ms, ledge_ms,
+         mapkeen_ms, used_pairs, poses) = pack_level_sprite_pairs(mani, tags)
         assert (len(spr_chr) == 2 * CHRBANK and len(pole_chr) == 1024
                 and len(ledge_chr) == 1024) \
             and len(ms) == ms_len
@@ -375,8 +397,12 @@ def main():
         lv["spr_poses"] = poses
         lv["ms"] = ms
         lv["ledge_ms"] = ledge_ms
-    assert len(chr_all) // 1024 <= 256, \
-        f"gameplay CHR pages exceed MMC5 low bank: {len(chr_all)//1024}"
+        if mapkeen_ms:
+            mapkeen_ms_best = mapkeen_ms
+    # 1KB page indices may exceed 255 once bg (4KB banks) + sprites grow past
+    # 256KB; the engine writes $5130 upper bits + $5120 low byte (10-bit bank).
+    assert len(chr_all) // 1024 <= 1024, \
+        f"gameplay CHR pages exceed MMC5 1MB: {len(chr_all)//1024}"
     while len(chr_all) % CHRBANK:
         chr_all.extend(bytes(1024))
     ledge_ms = per_level[0]["ledge_ms"]
@@ -460,6 +486,45 @@ def main():
     L.append("};")
     L.append("")
 
+    # Map Keen frames (bank 26): remapped tile ids for world-map sprite CHR.
+    # Flag metasprite is bank 6 (map_flags_draw). Not in ms_wram.
+    if mapkeen_ms_best:
+        for nm, data in sorted(mapkeen_ms_best.items()):
+            if nm.startswith("ms_FLAG"):
+                continue
+            L.append(carr(nm, data, ".prg_rom_26"))
+        # dir order 0N 1NE 2E 3SE 4S 5SW 6W 7NW; diagonals alias cardinals
+        mk_alias = ("N", "E", "E", "S", "S", "W", "W", "N")
+        L.append('__attribute__((used, section(".prg_rom_26"))) '
+                 'const unsigned char *const ms_mapkeen[8][3] = {')
+        for d in mk_alias:
+            # walk frame twice (no separate walk2 in the lean set), then stand
+            w1 = f"ms_MK_{d}_W1_R"
+            st = f"ms_MK_{d}_ST_R"
+            if w1 not in mapkeen_ms_best:
+                w1 = st = "ms_MK_E_ST_R"  # fallback
+            L.append(f"  {{ {w1}, {w1}, {st} }},")
+        L.append("};")
+    else:
+        L.append('__attribute__((used, section(".prg_rom_26"))) '
+                 'static const unsigned char ms_mapkeen_none[] = {128};')
+        L.append('__attribute__((used, section(".prg_rom_26"))) '
+                 'const unsigned char *const ms_mapkeen[8][3] = {')
+        for _ in range(8):
+            L.append("  { ms_mapkeen_none, ms_mapkeen_none, ms_mapkeen_none },")
+        L.append("};")
+    # Planted flag metasprite → bank 6 (map_flags_draw).
+    if mapkeen_ms_best and "ms_FLAG_R" in mapkeen_ms_best:
+        L.append(carr("ms_FLAG_R_b6", mapkeen_ms_best["ms_FLAG_R"], ".prg_rom_6"))
+        L.append('__attribute__((used, section(".prg_rom_6"))) '
+                 'const unsigned char *const ms_mapflag = ms_FLAG_R_b6;')
+    else:
+        L.append('__attribute__((used, section(".prg_rom_6"))) '
+                 'static const unsigned char ms_mapflag_none[] = {128};')
+        L.append('__attribute__((used, section(".prg_rom_6"))) '
+                 'const unsigned char *const ms_mapflag = ms_mapflag_none;')
+    L.append("")
+
     # each level blob -> 8KB chunks in .prg_rom_<bank>
     refs = {}
     for lv in per_level:
@@ -477,32 +542,110 @@ def main():
                       f".prg_rom_{lv['ms_bank']}"))
         L.append("")
 
-    # lvl_blob_refs[bank] -> the byte at $8000 of that bank (anchors sections
-    # and keeps the linker from GC'ing the bank). Reserved/unused banks -> 0.
+    # Level index tables: keep lvl_bank + lvl_game_no in the fixed region
+    # (read from hot paths). Bulk tables live in bank 6 (copied in level_load).
     maxbank = max(refs) if refs else 0
-    L.append("__attribute__((used)) const unsigned char *const "
-             "lvl_blob_refs[] = {")
-    for b in range(maxbank + 1):
-        L.append(f"  {refs.get(b, '0')},")
-    L.append("};")
     L.append("__attribute__((used)) const unsigned char lvl_bank[] = { "
              + ", ".join(str(lv["base_bank"]) for lv in per_level) + " };")
     L.append("__attribute__((used)) const unsigned char lvl_game_no[] = { "
              + ", ".join(str(lv["n"]) for lv in per_level) + " };")
-    L.append("__attribute__((used)) const unsigned char lvl_spr_pages[][8] = {")
+    # Relative 1KB page indices from SPR_PAGE_BASE (keeps tables u8-sized).
+    all_pages = []
     for lv in per_level:
-        L.append("  { " + ", ".join(str(v) for v in lv["spr_pages"]) + " },")
+        all_pages.extend(lv["spr_pages"])
+        all_pages.append(lv["pole_page"])
+        all_pages.append(lv["ledge_page"])
+    spr_page_base = min(all_pages) if all_pages else 0
+    assert max(all_pages) - spr_page_base < 256, \
+        f"sprite page span {max(all_pages)-spr_page_base} exceeds u8 relative"
+    T6 = '.prg_rom_6'  # cold level tables (level_load maps bank 6 to read)
+    L.append(f'__attribute__((used, section("{T6}"))) const unsigned char '
+             f'*const lvl_blob_refs[] = {{')
+    for b in range(maxbank + 1):
+        L.append(f"  {refs.get(b, '0')},")
     L.append("};")
-    L.append("__attribute__((used)) const unsigned char lvl_pole_page[] = { "
-             + ", ".join(str(lv["pole_page"]) for lv in per_level) + " };")
-    L.append("__attribute__((used)) const unsigned char lvl_ledge_page[] = { "
-             + ", ".join(str(lv["ledge_page"]) for lv in per_level) + " };")
-    L.append("__attribute__((used)) const unsigned char lvl_overlay_slot[] = { "
+    L.append(f'__attribute__((used, section("{T6}"))) '
+             f'const unsigned char lvl_spr_pages[][8] = {{')
+    for lv in per_level:
+        rel = [p - spr_page_base for p in lv["spr_pages"]]
+        L.append("  { " + ", ".join(str(v) for v in rel) + " },")
+    L.append("};")
+    L.append(f'__attribute__((used, section("{T6}"))) '
+             f'const unsigned char lvl_pole_page[] = {{ '
+             + ", ".join(str(lv["pole_page"] - spr_page_base)
+                         for lv in per_level) + " };")
+    L.append(f'__attribute__((used, section("{T6}"))) '
+             f'const unsigned char lvl_ledge_page[] = {{ '
+             + ", ".join(str(lv["ledge_page"] - spr_page_base)
+                         for lv in per_level) + " };")
+    L.append(f'__attribute__((used, section("{T6}"))) '
+             f'const unsigned char lvl_overlay_slot[] = {{ '
              + ", ".join(str(lv["overlay_slot"]) for lv in per_level) + " };")
-    L.append("__attribute__((used)) const unsigned char lvl_ms_bank[] = { "
+    L.append(f'__attribute__((used, section("{T6}"))) '
+             f'const unsigned char lvl_ms_bank[] = {{ '
              + ", ".join(str(lv["ms_bank"]) for lv in per_level) + " };")
-    L.append("__attribute__((used)) const unsigned char *const lvl_ms_ref[] = { "
+    L.append(f'__attribute__((used, section("{T6}"))) '
+             f'const unsigned char *const lvl_ms_ref[] = {{ '
              + ", ".join(f"lvl{lv['n']}_ms" for lv in per_level) + " };")
+    # world-map tables are appended to L below, then written once
+
+    # ---- world-map tables (GAMEMAPS level 0) when included in this ROM ----
+    map_json = ROOT / f"assets/converted/ck{EP}/map_nodes.json"
+    has_map = 0 in LEVELS and map_json.is_file()
+    map_rom_slot = LEVELS.index(0) if 0 in LEVELS else 0xFF
+    n_enter = n_fence = n_flag = 0
+    if has_map:
+        import json
+        meta = json.loads(map_json.read_text())
+        enters = meta.get("enters", [])
+        fences = meta.get("fences", [])
+        flags = meta.get("flags", [])
+        n_enter, n_fence, n_flag = len(enters), len(fences), len(flags)
+        playable = {n for n in LEVELS if n != 0}
+
+        def carr_u8(name, vals, sec=".prg_rom_26"):
+            body = ", ".join(str(v & 0xFF) for v in vals) if vals else "0"
+            return (f'__attribute__((used, section("{sec}"))) '
+                    f'const unsigned char {name}[] = {{ {body} }};')
+
+        L.append("/* world map nodes (from map_nodes.json) */")
+        L.append(carr_u8("map_enter_x", [e[0] for e in enters]))
+        L.append(carr_u8("map_enter_y", [e[1] for e in enters]))
+        L.append(carr_u8("map_enter_lv", [e[2] for e in enters]))
+        L.append(carr_u8("map_fence_x", [f[0] for f in fences]))
+        L.append(carr_u8("map_fence_y", [f[1] for f in fences]))
+        L.append(carr_u8("map_fence_lv", [f[2] for f in fences]))
+        L.append(carr_u8("map_fence_mt_lo", [f[3] & 0xFF for f in fences]))
+        L.append(carr_u8("map_fence_mt_hi", [(f[3] >> 8) & 0xFF for f in fences]))
+        # Flag holders: bank 6 (with map_flags_draw).
+        L.append(carr_u8("map_flag_x", [f[0] for f in flags], ".prg_rom_6"))
+        L.append(carr_u8("map_flag_y", [f[1] for f in flags], ".prg_rom_6"))
+        L.append(carr_u8("map_flag_lv", [f[2] for f in flags], ".prg_rom_6"))
+        # Enter tiles are game-levels 1..18 (18 = BWB ship) — need that many slots.
+        max_glv = max(max(LEVELS), 18)
+        rom_of = [0xFF] * (max_glv + 1)
+        for slot, gn in enumerate(LEVELS):
+            if 0 <= gn <= max_glv:
+                rom_of[gn] = slot
+        L.append(carr_u8("map_rom_of_lv", rom_of))
+        L.append("")
+        print(f"  world map: slot={map_rom_slot} enter={n_enter} "
+              f"fence={n_fence} flag={n_flag} "
+              f"playable_in_rom={sorted(playable)}")
+    else:
+        def stub(name):
+            return (f'__attribute__((used, section(".prg_rom_26"))) '
+                    f'const unsigned char {name}[] = {{0}};')
+        for nm in ("map_enter_x", "map_enter_y", "map_enter_lv",
+                   "map_fence_x", "map_fence_y", "map_fence_lv",
+                   "map_fence_mt_lo", "map_fence_mt_hi",
+                   "map_flag_x", "map_flag_y", "map_flag_lv"):
+            L.append(stub(nm))
+        L.append('__attribute__((used, section(".prg_rom_26"))) '
+                 'const unsigned char map_rom_of_lv[19] = {'
+                 + ", ".join(["255"] * 19) + "};")
+        L.append("")
+
     outc.write_text("\n".join(L) + "\n")
 
     # ---- emit levels.h (engine-facing) ----
@@ -511,12 +654,26 @@ def main():
          f"#define EPISODE {EP}",
          f"#define NUM_LEVELS {len(LEVELS)}",
          f"#define PRG_ROM_KB {prg_kb} /* level banks skip reserved code banks */",
-         f"#define SPR_CHR_BANK {per_level[0]['spr_pages'][4]} /* L1 $1000 sprite page */",
+         f"#define SPR_PAGE_BASE {spr_page_base} /* abs 1KB page = BASE + rel */",
+         f"#define SPR_CHR_BANK {per_level[0]['spr_pages'][4]} /* L0 $1000 sprite page (abs) */",
          f"#define SPR_MS_LEN {ms_len} /* per-level ms_wram image size */",
          f"#define CHR_ROM_KB {chr_rom_kb} /* bg ExRAM + normal/pole sprite pairs + blank */",
          f"#define TOTAL_CHR_KB {total_kb} /* power-of-two iNES CHR size */",
          f"#define CHR_UPPER 0 /* $5130: keen4 = {bg_chr_banks} bg banks < 64 */",
          f"#define SEAM_BLANK_EX {seam_blank_bank} /* ExRAM byte: all-zero CHR bank (overscan seam -> black) */",
+         f"#define HAS_WORLD_MAP {1 if has_map else 0}",
+         f"#define MAP_ROM_SLOT {map_rom_slot if has_map else 0xFF}",
+         # info 0xC001..0xC012 => game levels 1..18 (18 = BWB ship).
+         f"#define MAP_MAX_GAME_LV {max(max(LEVELS), 18) if has_map else 17}",
+         f"#define MAP_SHIP_LV 18 /* BWB ship: always re-enterable */",
+         f"#define MAP_N_ENTER {n_enter}",
+         f"#define MAP_N_FENCE {n_fence}",
+         f"#define MAP_N_FLAG {n_flag}",
+         "extern const unsigned char map_enter_x[], map_enter_y[], map_enter_lv[];",
+         "extern const unsigned char map_fence_x[], map_fence_y[], map_fence_lv[];",
+         "extern const unsigned char map_fence_mt_lo[], map_fence_mt_hi[];",
+         "extern const unsigned char map_flag_x[], map_flag_y[], map_flag_lv[];",
+         "extern const unsigned char map_rom_of_lv[]; /* game-level -> ROM slot or 0xFF */",
          "#endif", ""]
     outh.write_text("\n".join(H))
 

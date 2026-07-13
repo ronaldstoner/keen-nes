@@ -92,9 +92,10 @@ Generated and external directories (`assets/`, `src/gen/`, `build/`,
 Deliberate scope decisions (not bugs — noted so contributors understand the
 shape of the project):
 
-- **No world-map / overhead mode (yet).** The between-levels overworld is
-  omitted in the demo; the build is a level-focused slice, not the full game
-  flow. It's now tracked as a planned feature — see the roadmap below.
+- **World map is in.** Keen 4 boots on the overworld (GAMEMAPS level 0);
+  enter playable levels from map nodes, return on exit, and fences open as
+  levels are marked done. MapKeen art, flag throw, and the ship node are
+  still polish items — see the roadmap.
 - **MMC5 mapper.** Chosen for near-lossless per-8×8 backgrounds, per-level
   sprite CHR banks, and expansion audio — at the cost of requiring a larger,
   MMC5-capable cart/emulator rather than a plain NROM/MMC3 target.
@@ -104,13 +105,10 @@ shape of the project):
 
 ## Roadmap to full Keen 4 / known limitations
 
-The demo is a two-level slice. The hard, un-parallelizable work — the ExRAM
-background engine, the DOS-EXE extraction pipeline, and the 70→60 Hz physics —
-is done; what remains to reach a full episode is additive and mostly
-independent, which is exactly the profile that survives open-sourcing. Nothing
-below is an NES/MMC5 hardware wall (MMC5 has up to 1 MB PRG + 1 MB CHR, ample
-for all ~18 levels) — it's engine and content work. Effort tags: `S` small,
-`M` medium, `L` large, roughly in dependency order. Contributions welcome.
+The Keen 4 demo ships the **world map** plus **four playable stages** (ship,
+Border Village, Slug Village, Perilous Pit) — not the full ~18-level episode.
+The hard foundation work is done; extending coverage is mostly additive.
+Effort tags: `S` small, `M` medium, `L` large. Contributions welcome.
 
 **Foundation**
 
@@ -119,15 +117,18 @@ for all ~18 levels) — it's engine and content work. Effort tags: `S` small,
   `$8000 + m*8`). Bank-split it so the largest maps fit. Prereq for shipping all
   ~18 levels; the same move that earlier removed the 256-metatile cap.
 
-**World map & level flow (the minimap update)**
+**World map & level flow**
 
-- **World-map mode** (`L`) — overworld tilemap + node graph + Keen walking
-  between nodes, reusing the ExRAM background engine (simpler than a combat
-  level: no enemies).
-- **Level 0 — the Bean-with-Bacon Megarocket (ship)** (`M`) — a special
-  world-map node; depends on the world map.
-- **Level entry/exit + completion persistence** (`M`) — track completed levels,
-  gate map progress, carry score/lives/lifewater between levels.
+- **World-map mode** (`done` MVP) — overworld is ROM slot `MAP_ROM_SLOT`
+  (GAMEMAPS 0); map Keen walks with FG clip; A/B on `0xC0xx` enter tiles loads
+  that level; completing a level marks it done, re-opens `0xD0xx` fences via
+  cell overrides, and returns to the saved map position. Score/lives/ammo/
+  lifewater already persist. Still missing: MapKeen walk sprites (combat
+  frames reused), flag-throw animation on `0xF0xx` holders, teleporters.
+- **Level 0 — the Bean-with-Bacon Megarocket (ship)** (`M`) — special
+  world-map node / interior once the map polish is solid.
+- **Full episode level set on the map** (`L`) — depends on the metatile-cap
+  raise; the demo still packs only a small playable subset (see Makefile).
 
 **Sages (Council Members)**
 
@@ -168,7 +169,7 @@ for all ~18 levels) — it's engine and content work. Effort tags: `S` small,
 - **Remove remaining PC-era idioms** (`S`) — the port still carries DOS 16-bit
   assumptions in places that should be 8-bit on the 6502.
 
-**Critical path:** cap raise → world map → ship + level flow → Council Members +
+**Critical path:** cap raise → more levels on the map → ship + Council Members +
 ending yields a structurally complete game loop (map → levels → rescue → win)
 even before the full bestiary; then the actor-system refactor and per-enemy work
 is the long tail a community chews through in parallel.
@@ -202,9 +203,9 @@ This is a non-commercial, fan-made technical demo. It is **not** affiliated
 with, endorsed by, or sponsored by id Software, Bethesda Softworks, ZeniMax
 Media, or Apogee Software.
 
-The distributed tech demo is a single Keen 4 ROM with two test levels, for
-technical-demonstration and preservation purposes only — it is not a full
-game.
+The distributed tech demo is a Keen 4 ROM with the overworld and a four-level
+playable slice, for technical-demonstration and preservation purposes only —
+it is not a full game.
 
 The MIT license applies **only** to this project's original source code and
 tools. It grants **no** rights to *Commander Keen* — the characters, gameplay,

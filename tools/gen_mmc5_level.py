@@ -253,13 +253,42 @@ def compute_anim(cells, usage, ts):
     return anim_steps, F, speed_frames
 
 
+def collect_map_nodes(w, bg, info):
+    """World-map (GAMEMAPS level 0) info-plane nodes.
+
+    enter  : info in [0xC001, 0xC012]  -> A/B enters that game level
+    fence  : high byte 0xD0, low = level  -> FG removed when level done
+    flag   : high byte 0xF0, low = level  -> flag holder when level done
+    """
+    enters, fences, flags = [], [], []
+    for i, v in enumerate(info):
+        x, y = i % w, i // w
+        lo, hi = v & 0xFF, v >> 8
+        if 0xC001 <= v <= 0xC012:
+            enters.append((x, y, v - 0xC000))
+        elif hi == 0xD0 and 1 <= lo <= 17:
+            fences.append((x, y, lo, bg[i]))  # bg tile for empty-mt bake
+        elif hi == 0xF0 and 1 <= lo <= 17:
+            flags.append((x, y, lo))
+    enters.sort(key=lambda e: (e[2], e[0], e[1]))
+    fences.sort(key=lambda e: (e[2], e[0], e[1]))
+    flags.sort(key=lambda e: (e[2], e[0], e[1]))
+    return enters, fences, flags
+
+
 def build_entities(n, w, h, info):
     """Episode-aware enemy/platform tables from the Galaxy info plane.
 
     The three runtime enemy slots are deliberately generic: walker, secondary
     ground/flying actor, and tertiary actor.  Their concrete meaning is chosen
     by EPISODE in actors.c and must use that episode's ScanInfoLayer values.
+
+    Level 0 is the world map: no combat entities. High info values there are
+    map markers (0xC0xx enter / 0xD0xx fence / 0xF0xx flag), not door teleports.
     """
+    if n == 0:
+        return [], [], [], [], [], [], []
+
     def cells_of(pred):
         return [(i % w, i // w, v) for i, v in enumerate(info) if pred(v)]
 
@@ -682,6 +711,24 @@ def emit_level(n, ts):
                         metatile_for(onk, span_of_col(sx, cuts)), tx, ty))
     assert len(gd_recs) <= 6 and len(sw_recs) <= 4, \
         f"L{n}: gemdoors {len(gd_recs)}/6 switches {len(sw_recs)}/4 exceed cap"
+
+    # World map (level 0): bake fence empty-MTs and write map_nodes.json for
+    # gen_mmc5_rom (enter tiles, path fences, flag holders).
+    map_meta = None
+    if n == 0:
+        ens, fns, fls = collect_map_nodes(w, d["bg"], d["info"])
+        fence_recs = []
+        for (fx, fy, glv, bgt) in fns:
+            ekey = (bgt, 0, 0)
+            if ekey not in cells:
+                cells[ekey] = ts.composite(*ekey)
+            empty = metatile_for(ekey, span_of_col(fx, cuts))
+            fence_recs.append((fx, fy, glv, empty))
+        map_meta = dict(enters=ens, fences=fence_recs, flags=fls,
+                        w=w, h=h, spawn=None)
+        print(f"  map nodes: enter={len(ens)} fence={len(fence_recs)} "
+              f"flag={len(fls)}")
+
     N = len(mt_rows)
     assert N <= 0x10000, f"L{n}: {N} metatiles exceed u16"
 
@@ -731,16 +778,28 @@ def emit_level(n, ts):
                         for (x, y, t, ekey) in items), key=lambda e: e[0])
 
     meta = d["meta"]
-    # player spawn from the info plane (1 = facing right, 2 = facing left);
-    # fall back to bottom-left.
+    # Spawn from the info plane:
+    #   combat: 1 = face right, 2 = face left
+    #   world map (L0): 3 = map Keen (not 1/2)
+    # Fall back to bottom-left if no marker.
     spawn = None
-    for i, v in enumerate(d["info"]):
-        if v in (1, 2):
-            spawn = (i % w, i // w, 1 if v == 1 else -1)
-            break
+    if n == 0:
+        for i, v in enumerate(d["info"]):
+            if v == 3:
+                spawn = (i % w, i // w, 1)  # face E on map by default
+                break
+    if spawn is None:
+        for i, v in enumerate(d["info"]):
+            if v in (1, 2):
+                spawn = (i % w, i // w, 1 if v == 1 else -1)
+                break
     if spawn is None:
         spawn = (2, h - 4, 1)
     spawn_dir = spawn[2] & 0xFF
+    if map_meta is not None:
+        map_meta["spawn"] = [spawn[0], spawn[1], spawn[2]]
+    print(f"  spawn ({spawn[0]},{spawn[1]}) dir={spawn[2]}"
+          f"{' [MapKeen info=3]' if n == 0 else ''}")
 
     # ======================= assemble the blob =======================
     body = bytearray()
@@ -833,6 +892,11 @@ def emit_level(n, ts):
     outd.mkdir(parents=True, exist_ok=True)
     (outd / "mmc5.bin").write_bytes(blob)
     (outd / "mmc5_chr.bin").write_bytes(bytes(chr_rom))
+    if map_meta is not None:
+        import json
+        # Episode-level sidecar (gen_mmc5_rom packs it into mapdata).
+        map_path = ROOT / f"assets/converted/ck{EP}/map_nodes.json"
+        map_path.write_text(json.dumps(map_meta, indent=1))
 
     ecnt = [sum(1 for t in (bloogs, blets, babs) for e in t if e[-1] <= dd)
             for dd in (0, 1, 2)]

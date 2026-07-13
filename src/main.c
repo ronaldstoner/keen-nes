@@ -29,6 +29,7 @@
 #include "music.h"
 #include "gen/music.h"
 #include "mmc5/mmc5.h"
+#include "map.h"
 #define ITEM_STRIDE 5u   // MMC5 item record: x,y,type,empty_mt(u16)
 
 // PRG size generated into levels.h (PRG_ROM_KB: grows past 128KB when the
@@ -65,9 +66,11 @@ extern volatile unsigned char VRAM_INDEX;
 // the buffer under the 128B cap (74 + one 34B column + backdrop < 128).
 #define VRAM_BUDGET 96
 
-// last drawn tile window edges (in 8px tile coords)
-static unsigned char drawn_left; // horizontal tile coordinates never exceed 223
-static unsigned int drawn_top;   // K5 maps reach 500 vertical tile rows
+// Last drawn tile window edges (8px tile coords). drawn_left is u16: Slug
+// Village is 146 mt wide = 292 tile columns (>255); a u8 wraps and corrupts
+// the horizontal seam once the camera passes column 256.
+static unsigned int drawn_left;
+static unsigned int drawn_top; // K5 maps reach 500 vertical tile rows
 
 // ---------------------------------------------------------------------------
 // MMC5 ExRAM seam staging. The seam renderer writes nametable tile-ids
@@ -469,10 +472,10 @@ static unsigned char ntrow_of(unsigned int ty) {
   return r;
 }
 
-// nametable VRAM address of world 8px-tile
-static unsigned int nt_addr(unsigned char tx, unsigned int ty) {
-  unsigned int nt = (tx & 32) ? 0x400 : 0;
-  return 0x2000 + nt + ((unsigned int)ntrow_of(ty) << 5) + (tx & 31);
+// nametable VRAM address of world 8px-tile (tx may exceed 255 on wide maps)
+static unsigned int nt_addr(unsigned int tx, unsigned int ty) {
+  unsigned int nt = (tx & 32u) ? 0x400u : 0;
+  return 0x2000u + nt + ((unsigned int)ntrow_of(ty) << 5) + (tx & 31u);
 }
 
 
@@ -517,20 +520,20 @@ static void col_ex_stage(unsigned char col, unsigned int ty) {
 // MMC5 draw one full tile column (world 8px-tile x = tx): emit nametable
 // tile-ids through the VRAM buffer AND stage the parallel per-8x8 ExRAM
 // bytes at the matching coarse offsets. Left/right subtile fields of the
-// metatile are selected by tx parity.
-static void draw_column(unsigned char tx) {
+// metatile are selected by tx parity. tx is u16 (wide maps >255 columns).
+static void draw_column(unsigned int tx) {
   unsigned int ty = cam_y >> 3;
   unsigned char my0 = (unsigned char)(ty >> 1);
   unsigned char mx = (unsigned char)(tx >> 1);
-  unsigned char odd = (unsigned char)(tx & 1);
+  unsigned char odd = (unsigned char)(tx & 1u);
   unsigned char kt = odd ? 1 : 0;   // tr : tl  (top subtile field)
   unsigned char kb = odd ? 3 : 2;   // br : bl  (bottom subtile field)
-  unsigned char col = (unsigned char)(tx & 31);
+  unsigned char col = (unsigned char)(tx & 31u);
   unsigned char nmt, i;
   const unsigned char *src;
   unsigned char remaining;
   unsigned int tyy;
-  if (tx >= (unsigned char)(g_w * 2u))
+  if (tx >= (unsigned int)g_w * 2u)
     return;
   nmt = 16;
   if ((unsigned char)(my0 + nmt) > g_h)
@@ -647,18 +650,18 @@ static void row_ex_stage(unsigned char ntr, unsigned char tx) {
 // playfield); the overscan seam row is blackened by blacken_seam_row with no
 // nametable redraw. ExRAM lands via the row_ex fast-fill scatter.
 __attribute__((noinline)) static void draw_row(unsigned int ty) {
-  unsigned char tx = cam_x >> 3;
+  unsigned int tx = cam_x >> 3;
   const unsigned char *src;
   unsigned char remaining;
-  unsigned char txx;
+  unsigned int txx;
   if (ty >= (unsigned int)g_h * 2u)
     return;
   build_row_strip(ty);             // real tiles + ExRAM
-  src = seam_buf + (tx & 1);
+  src = seam_buf + (tx & 1u);
   remaining = 33;
   txx = tx;
   while (remaining) {
-    unsigned char run = 32 - (unsigned char)(txx & 31);
+    unsigned char run = (unsigned char)(32u - (txx & 31u));
     if (run > remaining)
       run = remaining;
     multi_vram_buffer_horz((const char *)src, run, nt_addr(txx, ty));
@@ -666,7 +669,7 @@ __attribute__((noinline)) static void draw_row(unsigned int ty) {
     txx += run;
     remaining -= run;
   }
-  row_ex_stage(ntrow_of(ty), tx);  // fast-fill the row's 32 ExRAM cells (bank 6)
+  row_ex_stage(ntrow_of(ty), (unsigned char)tx);
 }
 
 
@@ -675,8 +678,7 @@ __attribute__((noinline)) static void draw_row(unsigned int ty) {
 // $2007) AND ExRAM bytes (mode-2 so out-of-frame writes land) for the whole
 // 32x30 screen, then returns ExRAM to extended-attribute mode 1.
 static void draw_screen_full(void) {
-  unsigned int ty;
-  unsigned char tx, left = cam_x >> 3;
+  unsigned int ty, tx, left = cam_x >> 3;
   unsigned int top = cam_y >> 3;
   anim_reset();                     // rebuild the on-screen animated-cell list from scratch
   seam_ntr = ntrow_of(top);         // top window row = overscan seam (kept black)
@@ -688,11 +690,11 @@ static void draw_screen_full(void) {
     if (ntr == seam_ntr)            // aliased overscan seam row -> ExRAM black
       for (k = 0; k < 34; ++k)
         seam_ex[k] = SEAM_BLANK_EX;  // (real tiles stay in seam_buf)
-    src = seam_buf + (left & 1);
-    sex = seam_ex + (left & 1);
+    src = seam_buf + (left & 1u);
+    sex = seam_ex + (left & 1u);
     k = 0;
     for (tx = left; tx < left + 33u && tx < (unsigned int)g_w * 2u; ++tx, ++k) {
-      unsigned int off = (unsigned int)ntr * 32u + (unsigned char)(tx & 31);
+      unsigned int off = (unsigned int)ntr * 32u + (tx & 31u);
       unsigned char ex = sex[k];
       vram_adr(nt_addr(tx, ty));
       vram_put(src[k]);
@@ -987,13 +989,47 @@ static void present_screen(void) {
   ppu_mask(MASK_BG | MASK_SPR); // $18: mask left 8px (proven ExRAM seam rule)
 }
 
+extern const unsigned char lvl_game_no[]; // ROM slot -> game-level number
+
+// Map <-> stage: fade palettes to black, ppu_off, then level_load/present.
+// Body in bank 6 (WRAM/VRAM only).
+MAIN_COLD static void screen_fadeout_b(void) {
+  unsigned char step, i;
+  unsigned char p[32];
+  for (i = 0; i < 16; ++i) {
+    p[i] = g_pal[i];
+    p[16 + i] = spr_pal[i];
+  }
+  for (step = 0; step < 4; ++step) {
+    for (i = 0; i < 32; ++i) {
+      if ((p[i] & 0x30) != 0)
+        p[i] = (unsigned char)(p[i] - 0x10);
+      else
+        p[i] = 0x0F;
+    }
+    multi_vram_buffer_horz((const char *)p, 16, 0x3F00);
+    multi_vram_buffer_horz((const char *)(p + 16), 16, 0x3F10);
+    set_scroll();
+    ppu_wait_nmi();
+    ppu_wait_nmi(); // ~8 frames total
+  }
+  oam_clear();
+  ppu_off(); // level_load + present_screen run with rendering off
+}
+static void screen_fadeout(void) {
+  set_prg_bank(6, 0x80);
+  screen_fadeout_b();
+  // Bank left at 6; level_load remaps $8000 for tables/blob next.
+}
+
 // Door transition: block input, hold Keen at the
 // door and FADE HIM OUT (sprite palette to black), then INSTANT-CUT to the
 // destination — no camera scroll (which revealed the map + stalled frames
 // reloading while panning). The expensive reload happens off-screen in the
-// present_screen forced blank. Body banked to bank 6 (WRAM/OAM/VRAM-buffer
-// only; oam_meta_spr + multi_vram_buffer never retarget R6), like death_anim.
-MAIN_COLD static void door_fadeout_b(void) {
+// present_screen forced blank. Body banked to draw bank 26 (ms_frames + WRAM/
+// OAM/VRAM-buffer only; never retargets R6), like death_anim.
+#define MAIN_DRAW __attribute__((noinline, section(".prg_rom_26.text")))
+MAIN_DRAW static void door_fadeout_b(void) {
   unsigned char i, j, sp[16];
   int bx = (int)(((pl_x - KEEN_CLIP_XL) >> 4) - cam_x);
   int by = (int)(((pl_y - KEEN_CLIP_YL) >> 4) - cam_y);
@@ -1019,8 +1055,8 @@ MAIN_COLD static void door_fadeout_b(void) {
 // redraw, NO scroll (which revealed the map layout + stalled frames panning
 // there). The expensive reload happens off-screen in present_screen's blank.
 __attribute__((noinline)) static void door_transition(void) {
-  set_prg_bank(6, 0x80);
-  door_fadeout_b();              // input-locked walk-in + Keen fade-out (bank 6)
+  set_prg_bank(26, 0x80);
+  door_fadeout_b();              // input-locked walk-in + Keen fade-out (bank 26)
   set_prg_bank(lvl_bank[g_level], 0x80);
   pl_x = pl_door_x; pl_y = pl_door_y;
   pl_vx = pl_vy = 0; pl_on_ground = 0;
@@ -1057,7 +1093,6 @@ __attribute__((noinline)) static void handle_gem_switch_door(void) {
   }
 }
 
-extern const unsigned char lvl_game_no[]; // ROM level -> game level number
 
 // ===========================================================================
 // IRQ vector target. On MMC5, backgrounds render per-cell via ExRAM extended
@@ -1078,12 +1113,10 @@ extern const unsigned char lvl_game_no[]; // ROM level -> game level number
 // fallback, so it degrades to the old placeholder rather than garbling.
 // Physics is frozen; Keen just arcs upward over the (frozen) scene.
 //
-// Body runs from bank 6 (MAIN_COLD): it touches only WRAM (player/camera
-// globals, the ms_* metasprite tables) and neslib draw calls that never
-// retarget R6, so the near-full fixed region only pays the tiny trampoline.
-// The level song holds during the ~0.8s arc (kmusic_sync retargets R6 and
-// so cannot run from bank 6); SFX_DIE is played by the fixed trampoline.
-MAIN_COLD static void death_anim_b(void) {
+// Body runs from draw bank 26: WRAM/OAM + ms_frames (also bank 26). Fixed
+// region only pays the trampoline. Level song holds during the ~0.8s arc
+// (kmusic_sync retargets R6); SFX_DIE is played by the fixed trampoline.
+MAIN_DRAW static void death_anim_b(void) {
   int vy = -6; // screen px/frame; gravity pulls it down each frame
   int dy = 0;
   unsigned char i;
@@ -1098,18 +1131,15 @@ MAIN_COLD static void death_anim_b(void) {
     oam_hide_rest();
     set_scroll();
     ppu_wait_nmi();
-    // This body runs from HUD bank 6. Advance the 140Hz death effect while
-    // animation frames pass, restoring bank 6 after its one batched data read.
-    // Previously the sequencer froze here and held the last pulse forever if
-    // the animation fell directly into GAME OVER.
-    ksfx_frame_hud();
+    // Advance the 140Hz death effect; restore bank 26 after the SFX bank read.
+    ksfx_frame_draw();
     dy += vy;
     ++vy; // arc: up first, then fall past the bottom
   }
 }
 static void death_anim(void) {
   ksfx_play(SFX_DIE); // fixed region: retargets R6 to the sfx/level bank
-  set_prg_bank(6, 0x80);
+  set_prg_bank(26, 0x80);
   death_anim_b();
   set_prg_bank(lvl_bank[g_level], 0x80);
 }
@@ -1119,12 +1149,17 @@ static void death_anim(void) {
 #endif
 
 // GAME-FLOW STATE MACHINE:
-//   title -> difficulty select -> play level 0..NUM_LEVELS-1
-//     death, lives left  -> respawn in place (as before)
-//     death, no lives    -> GAME OVER screen  -> back to title
-//     finish last level  -> ENDING ("demo complete") -> back to title
+//   title -> difficulty select ->
+//     HAS_WORLD_MAP: overworld (MAP_ROM_SLOT) <-> enter playable levels
+//       finish a level   -> mark done, open fences, return to map
+//       all playable done -> ENDING
+//     else (linear demo): play level 0..NUM_LEVELS-1 in order
+//       finish last level -> ENDING
+//     death, lives left  -> respawn in place
+//     death, no lives    -> GAME OVER -> title
 // item pickup: Keen's clip box vs item cells. Extracted (noinline) so this big
 // block stays out of main's one huge function (LTO inflates main otherwise).
+
 MAIN_COLD static unsigned char item_reward_b(unsigned char t) {
   if (t == 15) {
     if (++pl_lifewater >= 100) {
@@ -1159,13 +1194,20 @@ MAIN_COLD static unsigned char item_reward_b(unsigned char t) {
   return SFX_GEM;
 }
 
-__attribute__((noinline)) static void item_pickup(void) {
+// WRAM-only hit scan (bank 6). Apply + sfx stay fixed so $8000 banking stays
+// the level blob (no execute-from-wrong-bank risk).
+// hits[] is BSS (not stack): soft stack has little headroom above ms_wram.
+#define ITEM_HIT_MAX 4
+static unsigned int item_hits[ITEM_HIT_MAX];
+static unsigned char item_hit_n;
+MAIN_COLD static void item_scan_b(void) {
   const unsigned char *it;
-  unsigned char ptx = pl_x >> 8, pty = pl_y >> 8; // Keen metatile coords
+  unsigned char ptx = pl_x >> 8, pty = pl_y >> 8;
   unsigned char xlo = (ptx >= 2) ? (unsigned char)(ptx - 2) : 0;
   unsigned char xhi = ptx + 2;
+  unsigned char n = 0;
   unsigned int i;
-  item_sweep();
+  item_sweep_b();
   while (item_lo < g_nitems &&
          g_items[(unsigned int)item_lo * ITEM_STRIDE] < xlo)
     ++item_lo;
@@ -1189,19 +1231,37 @@ __attribute__((noinline)) static void item_pickup(void) {
     cy0 = (unsigned int)it[1] << 8;
     if (item_sx0 < cx0 + 256u && cx0 < item_sx1 &&
         item_sy0 < cy0 + 256u && cy0 < item_sy1) {
-      unsigned char t = it[2];
-      cell_pick(i);
-      if (t >= 4 && t <= 9) {
-        static const unsigned char pts[6] = {0x12, 0x22, 0x52, 0x13, 0x23, 0x53};
-        score_add(pts[t - 4]);
-        ksfx_play(SFX_ITEM);
-      } else {
-        unsigned char snd;
-        set_prg_bank(6, 0x80);
-        snd = item_reward_b(t);
-        set_prg_bank(lvl_bank[g_level], 0x80);
-        ksfx_play(snd);
-      }
+      if (n < ITEM_HIT_MAX)
+        item_hits[n++] = i;
+    }
+  }
+  item_hit_n = n;
+}
+__attribute__((noinline)) static void item_pickup(void) {
+  unsigned char n, j;
+  set_prg_bank(6, 0x80);
+  item_scan_b();
+  n = item_hit_n;
+  set_prg_bank(lvl_bank[g_level], 0x80);
+  for (j = 0; j < n; ++j) {
+    unsigned int i = item_hits[j];
+    const unsigned char *it = g_items + i * ITEM_STRIDE;
+    unsigned char t = it[2];
+    // Avoid overflowing the VRAM buffer on a busy seam frame (would corrupt
+    // the next NMI flush and often freeze). Retry the pickup next frame.
+    if (VRAM_INDEX >= VRAM_BUDGET)
+      break;
+    cell_pick(i);
+    if (t >= 4 && t <= 9) {
+      static const unsigned char pts[6] = {0x12, 0x22, 0x52, 0x13, 0x23, 0x53};
+      score_add(pts[t - 4]);
+      ksfx_play(SFX_ITEM);
+    } else {
+      unsigned char snd;
+      set_prg_bank(6, 0x80);
+      snd = item_reward_b(t);
+      set_prg_bank(lvl_bank[g_level], 0x80);
+      ksfx_play(snd);
     }
   }
 }
@@ -1229,6 +1289,7 @@ int main(void) {
     difficulty_select(); // the port's only menu: EASY/NORMAL/HARD
 
     newgame_reset(); // fresh lives/score/ammo/quest/keys (banked)
+    map_newgame();   // clear levels_done + saved map position
     { // clear collected-item state (static bitmap persists across games)
       unsigned char i;
       for (i = 0; i < sizeof(picked_bm); ++i)
@@ -1237,27 +1298,34 @@ int main(void) {
       item_lo = 0;
     }
 
+#if HAS_WORLD_MAP
+    level_load(MAP_ROM_SLOT);
+    g_on_map = 1;
+#else
     level_load(BOOT_LVL);
+    g_on_map = 0;
+#endif
+    // door_state_reset clears ov_*; map_apply_done must run after it.
     door_state_reset();
+#if HAS_WORLD_MAP
+    if (g_on_map)
+      map_apply_done();
+#endif
     kmusic_play(lvl_game_no[g_level]);
-
     bank_bg(0);
     bank_spr(1);
-
     cam_bounds();
     ksfx_init();
     kmusic_init();
     player_init();
-    actors_init();
+#if HAS_WORLD_MAP
+    if (g_on_map)
+      map_player_place();
+    else
+#endif
+      actors_init();
     cam_center();
     set_vram_buffer();
-    // GAMEPLAY sprites are 8x16 (PPUCTRL bit 5): halves the OAM entries +
-    // metasprite parts (fewer 8-per-scanline dropouts, less sprite-draw CPU).
-    // Sprites fetch CHR from set A exactly as in 8x8; the ExRAM extended-
-    // attribute background is unaffected. oam_size(1) is set in the banked
-    // level_chr_refresh (bank 6) which present_screen runs -> costs the near-
-    // full fixed region nothing. oam_size(0) before title_show keeps the
-    // title/menu at 8x8 (their sprite overlays / '>' cursor).
     present_screen();
 
     // Inhibit the APU frame IRQ (undefined power-on state). The MMC5 ExRAM
@@ -1268,233 +1336,240 @@ int main(void) {
 
   while (1) {
     unsigned char pad = pad_poll(0);
-    unsigned char new_left;
+    unsigned int new_left;
     unsigned int new_top;
 
-    // Start toggles pause + status readout (score / ammo / lives)
-    {
-      static unsigned char paused, start_prev;
-      unsigned char start_now = pad & PAD_START;
-      if (start_now && !start_prev)
-        paused ^= 1;
-      start_prev = start_now;
-      if (paused) {
-        // freeze; the persistent HUD keeps showing score/ammo/lives
-        ksfx_frame();
-        kmusic_sync();
-        ppu_wait_nmi();
-        continue;
+    // ----- mode-specific GAME LOGIC (map vs combat) -----
+#if HAS_WORLD_MAP
+    if (g_on_map) {
+      // MAP MODE: walk + enter only. No combat sim.
+      map_player_update(pad);
+      if (pl_map_enter) {
+        unsigned char slot = pl_map_enter;
+        unsigned char i;
+        pl_map_enter = 0;
+        map_save_pos();
+        g_on_map = 0;
+        ksfx_play(SFX_MAPENTER); // map-enter whoosh (not level-exit)
+        screen_fadeout();
+        level_load(slot);
+        door_state_reset();
+        kmusic_play(lvl_game_no[g_level]);
+        for (i = 0; i < sizeof(picked_bm); ++i)
+          picked_bm[i] = 0;
+        picked_any = 0;
+        item_lo = 0;
+        cam_bounds();
+        player_init();
+        actors_init(); // combat only
+        cam_center();
+        present_screen();
       }
-    }
-
-    // Select is inert: the DOS-style full-screen status overlay was cut
-    // from the demo (the in-game HUD already shows score/ammo/lives).
-
-    actors_set_window(cam_x, cam_y); // actors within camera + 4 tiles run
-    player_update(pad);
-
-    // gem doors / switches / authentic door transition (player.c DETECTS on its
-    // collision cells; the cold action runs in a separate function to stay out
-    // of main's inline bloat). All three are rare, off the hot path.
-    if (pl_gem_hit || pl_switch_hit || pl_door)
-      handle_gem_switch_door();
-
-    if (pl_level_done) { // sandwich secured: flash, then restart level
-      unsigned char i;
-      pl_level_done = 0;
-      for (i = 0; i < 90; ++i) {
-        one_vram_buffer((i & 4) ? 0x30 : 0x0F, 0x3F00);
-        ksfx_frame();
-        ppu_wait_nmi();
-      }
-      
-      // Finished the LAST demo level -> ENDING screen, then back to title
-      // (the old code wrapped to level 0 forever; now the demo has a real
-      // bookend). Checked after the flash so the pickup still reads.
-      if ((unsigned char)(g_level + 1) >= NUM_LEVELS) {
-        ending = 1;
-        break;
-      }
-      // No blanket completion award (the quest tally is on the actual t==12
-      // pickup): side exits and exit doors complete a level without points or tally.
-#if EPISODE == 5
-      pl_keycard = 0; // keycards don't carry across levels
-#endif
-      level_load(g_level + 1); // next level (last level breaks above)
-      door_state_reset();
-      kmusic_play(lvl_game_no[g_level]);
-      for (i = 0; i < sizeof(picked_bm); ++i)
-        picked_bm[i] = 0; // new level = new item table
-      picked_any = 0;
-      item_lo = 0;        // cursor restarts
-      cam_bounds();
-      actors_init();
-      pl_dead = 2; // reuse the respawn path below (no life lost)
-    }
-    {
-    unsigned char touched;
-    set_prg_bank(26, 0x80); // actors_touch_player is in the cold draw bank
-    touched = actors_touch_player();
-    set_prg_bank(lvl_bank[g_level], 0x80);
-    if (touched || pl_dead) { // Keen dies / level-done respawn
-      if (pl_dead != 2) {       // a REAL death (pl_dead==2 = level-done reuse)
-        death_anim();           // SFX_DIE + the launch-up death animation
-        if (pl_lives == 0)      // out of Keens -> GAME OVER (ending stays 0)
-          break;
-        --pl_lives;
-      }
-      player_init();
+      pl_look_off = 0;
       pl_dead = 0;
-      cam_center();
-      present_screen();
-    }
+      pl_level_done = 0;
+      pl_gem_hit = pl_switch_hit = pl_door = 0;
+    } else
+#endif
+    {
+      // COMBAT MODE
+      {
+        static unsigned char paused, start_prev;
+        unsigned char start_now = pad & PAD_START;
+        if (start_now && !start_prev)
+          paused ^= 1;
+        start_prev = start_now;
+        if (paused) {
+          ksfx_frame();
+          kmusic_sync();
+          ppu_wait_nmi();
+          continue;
+        }
+      }
+
+      actors_set_window(cam_x, cam_y);
+      player_update(pad);
+      if (pl_gem_hit || pl_switch_hit || pl_door)
+        handle_gem_switch_door();
+
+      if (pl_level_done) {
+        unsigned char i;
+        pl_level_done = 0;
+#if HAS_WORLD_MAP
+        // Brief complete flash, then fade back to map (fences + flags).
+        for (i = 0; i < 30; ++i) {
+          one_vram_buffer((i & 4) ? 0x30 : 0x0F, 0x3F00);
+          ksfx_frame();
+          ppu_wait_nmi();
+        }
+        map_mark_done(lvl_game_no[g_level]);
+        if (map_all_playable_done()) {
+          ending = 1;
+          break;
+        }
+#if EPISODE == 5
+        pl_keycard = 0;
+#endif
+        screen_fadeout();
+        level_load(MAP_ROM_SLOT);
+        g_on_map = 1;
+        door_state_reset(); // before map_apply_done (ov_reset)
+        map_apply_done();
+        kmusic_play(lvl_game_no[g_level]);
+        for (i = 0; i < sizeof(picked_bm); ++i)
+          picked_bm[i] = 0;
+        picked_any = 0;
+        item_lo = 0;
+        cam_bounds();
+        player_init();
+        map_player_place(); // no actors_init on map
+        cam_center();
+        present_screen();
+#else
+        for (i = 0; i < 90; ++i) {
+          one_vram_buffer((i & 4) ? 0x30 : 0x0F, 0x3F00);
+          ksfx_frame();
+          ppu_wait_nmi();
+        }
+        if ((unsigned char)(g_level + 1) >= NUM_LEVELS) {
+          ending = 1;
+          break;
+        }
+#if EPISODE == 5
+        pl_keycard = 0;
+#endif
+        level_load(g_level + 1);
+        door_state_reset();
+        kmusic_play(lvl_game_no[g_level]);
+        for (i = 0; i < sizeof(picked_bm); ++i)
+          picked_bm[i] = 0;
+        picked_any = 0;
+        item_lo = 0;
+        cam_bounds();
+        actors_init();
+        pl_dead = 2;
+#endif
+      }
+#if HAS_WORLD_MAP
+      if (!g_on_map)
+#endif
+      {
+        unsigned char touched;
+        set_prg_bank(26, 0x80);
+        touched = actors_touch_player();
+        set_prg_bank(lvl_bank[g_level], 0x80);
+        if (touched || pl_dead) {
+          if (pl_dead != 2) {
+            death_anim();
+            if (pl_lives == 0)
+              break;
+            --pl_lives;
+          }
+          player_init();
+          pl_dead = 0;
+          cam_center();
+          present_screen();
+          // Skip seam/item/draw for this frame: a dead Keen must not collect
+          // items or run more nested C (soft-stack headroom is tight).
+          continue;
+        }
+      }
     }
 
-    // camera follows player (max 8px/frame horizontally, 7px vertically:
-    // one seam column/row update per frame). pl_look_off shifts the
-    // vertical target for the look up/down peek (DOS: -27..+107px); it
-    // ramps at 1px/tic in player.c, so the camera tracks it through this
-    // same rate-limited path — seams stream exactly as for walking.
+    // ----- SHARED: camera + ExRAM seam (both modes need map scroll) -----
     cam_target();
     cam_step();
-
-    // seam drawing yields when the vram buffer runs hot (VRAM_BUDGET):
-    // after a missed NMI the previous batch is still unflushed and the
-    // 128-byte buffer would silently drop writes = permanent garbage
-    // tiles. drawn_left/top lag instead and catch up next frame.
     new_left = cam_x >> 3;
     new_top = cam_y >> 3;
-    // VERTICAL seam handling runs EVERY frame: the black overscan seam row must
-    // track the display top (ntrow_of(cam_y>>3)) exactly, or the previous
-    // frame's black row drifts into the VISIBLE area as the camera scrolls (a
-    // black bar, worse than the overscan alias it hides). cam_y moves <=7px/
-    // frame so this catches up <=1 tile row/frame. Blackening is ExRAM-only (a
-    // zero CHR bank -> any tile black), so the nametable keeps real tiles and
-    // rows show real content the instant they leave the overscan.
     seam_ntr = ntrow_of(new_top);
-    if (drawn_top < new_top) { // scroll DOWN
+    if (drawn_top < new_top) {
       ++drawn_top;
-      draw_row(drawn_top + 29u);         // incoming bottom = restore (fast-fill)
-      blacken_seam_row();                // new seam row = fast blank (no nametable)
-    } else if (drawn_top > new_top) { // scroll UP
+      draw_row(drawn_top + 29u);
+      blacken_seam_row();
+    } else if (drawn_top > new_top) {
       --drawn_top;
-      blacken_seam_row();                // incoming top == new seam = fast blank
-      draw_row(drawn_top + 1u);          // restore the row that left the seam
+      blacken_seam_row();
+      draw_row(drawn_top + 1u);
     }
-    // HORIZONTAL catch-up: yields when the vram buffer runs hot (VRAM_BUDGET).
-    // Uniform 60Hz frames (double-tic gone) so this runs EVERY frame — the seam
-    // catches up immediately, which smooths scrolling. draw_column re-blackens
-    // its seam-row cell (ExRAM only), so horizontal scroll never un-blacks it.
+    // Horizontal catch-up (drawn_left is u16: maps wider than 128 mt need it).
     while (drawn_left < new_left && VRAM_INDEX < VRAM_BUDGET) {
       ++drawn_left; // moved right: draw incoming right col
       draw_column(drawn_left + 32u);
     }
     while (drawn_left > new_left && VRAM_INDEX < VRAM_BUDGET) {
-      // ExRAM extended attributes are one shared 32-column page even though
-      // the two horizontal nametables hold 64 independent tile-ID columns.
-      // The 33rd window column therefore aliases the first.  The masked-left
-      // strip hides the new left edge; refresh the old edge, which has become
-      // visible after its old +32 alias left the right edge.  Redrawing its
-      // tile IDs is harmless, and the hidden incoming column is drawn on the
-      // next tile step when it becomes visible.
-      draw_column(drawn_left--); // new edge remains masked
+      // ExRAM is one 32-col page; 33rd window col aliases the first. Refresh
+      // the old left edge as it becomes visible under the left mask strip.
+      draw_column(drawn_left--);
     }
 
-    // background tile animation: advance the global phase every anim_speed
-    // frames (TILEINFO rate), then refresh a SLICE of the on-screen
-    // animated cells to the current phase every frame. Spreading the rewrites
-    // (vs one big scan at each phase step) keeps the frame budget (a scan spike
-    // dropped ~6 frames/60).
     if (anim_frames > 1) {
-      if (--anim_timer == 0) {   // advance the phase at the TILEINFO rate
+      if (--anim_timer == 0) {
         anim_timer = anim_speed;
         if (++anim_phase >= anim_frames)
           anim_phase = 0;
       }
-      // refresh a rotating slice of the cell list, but only when the seam left
-      // ExRAM-flush room this frame -- a heavy seam takes the vblank budget and
-      // anim defers (cells refresh a frame or two later, invisible at scroll
-      // speed). CRITICAL: also defer when the VERTICAL seam ran (blank_on set by
-      // blacken_seam_row / row_n by draw_row) -- those now flush via the fast
-      // row_ex/blank path so they DON'T raise exs_n, but they still consume the
-      // vblank budget. Staging ~46 anim singletons (~33cy each) on top of a
-      // vertical-scroll frame overran vblank -> $5104 stuck at 2 -> grey. This
-      // gate is THE remaining half of the grey fix.
       if (exs_n < 40u && !blank_on && !col_on && row_n == 0u)
         anim_tick();
     }
 
-    item_pickup();  // Keen's clip box vs item cells (extracted to keep main lean)
-
+    // ----- combat-only world interactions -----
+    if (!g_on_map) {
+      item_pickup();
 #if EPISODE == 5
-    // fuse breaking: player.c reported a
-    // hard pogo slam on (pl_fuse_x, pl_fuse_y). If a fuse-top
-    // pseudo-item (type 13) lives there, both fuse cells swap to the
-    // broken art (types 13+14 records carry the metatiles); breaking
-    // the last fuse completes the level.
-    if (pl_fuse_hit) {
-      const unsigned char *it = g_items;
-      unsigned int i;
-      unsigned char remaining = 0, broke = 0;
-      pl_fuse_hit = 0;
-      for (i = 0; i < g_nitems; ++i, it += ITEM_STRIDE) {
-        if (it[2] < 13)
-          continue;
-        if (PICKED(i))
-          continue;
-        // records are x-sorted and appended top-before-bottom, so the
-        // type-13 top is always seen before its type-14 bottom cell
-        if (it[0] == pl_fuse_x &&
-            (it[2] == 13 ? it[1] == pl_fuse_y
-                         : (broke && it[1] == pl_fuse_y + 1))) {
-          // the slammed fuse: erase this cell (top or bottom record)
-          cell_pick(i);
-          if (it[2] == 13)
-            broke = 1;
-        } else if (it[2] == 13)
-          ++remaining; // some other fuse is still intact
+      if (pl_fuse_hit) {
+        const unsigned char *it = g_items;
+        unsigned int i;
+        unsigned char remaining = 0, broke = 0;
+        pl_fuse_hit = 0;
+        for (i = 0; i < g_nitems; ++i, it += ITEM_STRIDE) {
+          if (it[2] < 13)
+            continue;
+          if (PICKED(i))
+            continue;
+          if (it[0] == pl_fuse_x &&
+              (it[2] == 13 ? it[1] == pl_fuse_y
+                           : (broke && it[1] == pl_fuse_y + 1))) {
+            cell_pick(i);
+            if (it[2] == 13)
+              broke = 1;
+          } else if (it[2] == 13)
+            ++remaining;
+        }
+        if (broke) {
+          ksfx_play(SFX_SHOTHIT);
+          if (!remaining)
+            pl_level_done = 1;
+        }
       }
-      if (broke) {
-        ksfx_play(SFX_SHOTHIT); // stand-in for the explosion sound
-        if (!remaining)
-          pl_level_done = 1; // all fuses broken: machine down
-      }
-    }
 #endif
+    }
 
-    one_vram_buffer(g_pal[0], 0x3F00); // keep backdrop ours (neslib's
-                                        // init upload stomps slot 0)
-    oam_set(0); // rewind OAM; oam_hide_rest below beats a full oam_clear
-    hud_draw();
-    // player_draw/shots_draw/actors_draw are all banked to a dedicated cold bank
-    // (26; pure WRAM/OAM) to relieve the fixed region AND the full HUD bank; map
-    // it around the three calls, restore the level bank (see actors.c/player.c).
-    set_prg_bank(26, 0x80);
-    player_draw(disp_cam_x, disp_cam_y);
-    shots_draw(disp_cam_x, disp_cam_y);
-    actors_draw(disp_cam_x, disp_cam_y);
+    // ----- SHARED present: OAM + audio + ExRAM flush -----
+    one_vram_buffer(g_pal[0], 0x3F00);
+    oam_set(0);
+    if (!g_on_map)
+      hud_draw();
+    if (g_on_map) {
+      set_prg_bank(6, 0x80);
+      map_flags_draw(disp_cam_x, disp_cam_y);
+      set_prg_bank(26, 0x80);
+      map_player_draw(disp_cam_x, disp_cam_y);
+    } else {
+      set_prg_bank(26, 0x80);
+      player_draw(disp_cam_x, disp_cam_y);
+      shots_draw(disp_cam_x, disp_cam_y);
+      actors_draw(disp_cam_x, disp_cam_y);
+    }
     set_prg_bank(lvl_bank[g_level], 0x80);
     oam_hide_rest();
     ksfx_frame();
     kmusic_sync();
     set_scroll();
     ppu_wait_nmi();
-    // Pole art is a precomputed 1KB CHR overlay. Apply its one-page change in
-    // vblank after OAM for the upcoming frame is complete, avoiding even a
-    // one-scanline transition tear. The function returns immediately except
-    // on grab/release.
-    level_chr_overlay(pl_ledge ? 2u : pl_pole);
-    // MMC5: flush this frame's staged ExRAM bytes in the post-NMI vblank
-    // window ($5104=2 so the writes land out-of-frame, then back to mode 1).
-    // The nametable tile-ids the seam drew were flushed by the NMI above, so
-    // nametable + ExRAM land in the same frame's end state.
-    // exram_blast is banked to bank 6 (fixed-region relief); it touches only
-    // WRAM + MMC5 regs, no level blob. Inline $5114 map/restore (set_prg_bank is
-    // just this write) around the call.
-    *(volatile unsigned char *)0x5114 = 0x86;           // $5114 = 0x80|6 -> bank 6
+    if (!g_on_map)
+      level_chr_overlay(pl_ledge ? 2u : pl_pole);
+    *(volatile unsigned char *)0x5114 = 0x86;
     exram_blast();
-    // The tile IDs were consumed by NMI and their matching ExRAM bytes are
-    // now complete. Publish the camera only after both halves landed.
     disp_cam_x = cam_x;
     disp_cam_y = cam_y;
     set_scroll();

@@ -94,3 +94,8 @@ void ksfx_frame(void) {
 void ksfx_frame_hud(void) {
   frame_to(HUD_BANK);
 }
+
+// Death fade runs from draw bank 26 (ms_frames lives there).
+void ksfx_frame_draw(void) {
+  frame_to(26);
+}
