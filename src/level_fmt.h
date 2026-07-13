@@ -179,6 +179,14 @@
 #define MMC5_OFF_ANIMBASE 36  /* u8: absolute 4KB bank of the anim region */
 #define MMC5_OFF_ANIMNBK  37  /* u8: anim region size in 4KB banks (0=none) */
 #define MMC5_OFF_ENTDIR   40  /* 8 x {u32 off, u16 count} */
+/* Pre-flattened per-8x8 planes (gen_mmc5_rom.append_planes): one TILES byte
+ * and one EXRAM byte per 8px cell, row-major, pitch = w*2, packed so no
+ * plane row straddles an 8KB bank; a per-row directory (bank-from-base u8 +
+ * $8000-window addr u16) lives in the u16-addressable region. The seam
+ * renderer block-copies strips from these; metatile records stay for
+ * collision and single-cell rewrites. */
+#define MMC5_OFF_PLANE_DIR    88 /* u16: row-directory blob offset */
+#define MMC5_OFF_PLANE_NBANKS 90 /* u8: tiles-plane banks; EX plane follows */
 #define MMC5_MT_FIELDS    10  /* 8B render AoS records + top[N] + flags[N] */
 #define MMC5_EX_BANK_MASK 0x3F
 #define MMC5_EX_PAL_SHIFT 6
@@ -189,11 +197,13 @@
 // stored as a u16 at header byte 38 (the old reserved u16). 0 = none. Layout:
 //   byte 0  n_gd (gem-door/holder records, <= MMC5_MAX_GD)
 //   byte 1  n_sw (switch records,          <= MMC5_MAX_SW)
-//   n_gd x 10B: hx,hy,color, placed_mt(u16), dx,dy,dh, open_mt(u16)
+//   n_gd x 18B: hx,hy,color, placed_mt(u16), dx,dy0,nrows, open_mt[5](u16)
 //   n_sw x  8B: sx,sy, off_mt(u16), on_mt(u16), tx,ty
 // Placing the matching gem (pl_keys bit `color`) at holder (hx,hy) swaps that
-// cell to metatile placed_mt and opens the dh-tall door column at (dx,dy) to
-// the passable metatile open_mt. A switch at (sx,sy) toggles its own art
+// cell to metatile placed_mt and opens the door column at (dx,dy0..+nrows-1)
+// to open_mt[row] -- per-row FULLY-OPEN art (each cell's DOS +1 anim chain
+// walked to its terminal; the original replaces the door run plus its two
+// ground tiles, height+2). A switch at (sx,sy) toggles its own art
 // off_mt<->on_mt and the B-block marker at target (tx,ty).
 #define MMC5_OFF_EXT      38   /* u16 blob offset of the gem-door/switch ext */
 #define MMC5_MAX_GD       6    /* max gem-holder/door records per level */
@@ -207,6 +217,13 @@
 extern unsigned char ov_mx[MMC5_MAX_OVR], ov_my[MMC5_MAX_OVR];
 extern unsigned int ov_mt[MMC5_MAX_OVR];
 extern unsigned char ov_n;
+/* MT-record bank + flat plane addressing (level.c) */
+extern unsigned char mt_bank;      /* $80| bank holding the MT record table */
+extern unsigned char pln_ex_delta; /* banks from tiles plane to EX plane */
+extern unsigned int pln_pitch;     /* bytes per plane row (= w*2) */
+extern unsigned char pln_cur_bank; /* set by pln_locate: $80| tiles bank */
+extern unsigned char pln_rows_left;/* set by pln_locate: rows left in bank */
+unsigned int pln_locate(unsigned int ty); /* -> $8000-window row address */
 void ov_reset(void);
 void ov_add(unsigned char mx, unsigned char my, unsigned int mt);
 // ===========================================================================
@@ -252,11 +269,11 @@ extern unsigned char anim_base, anim_nbanks, anim_frames, anim_speed;
 // raw bytes (vs typed arrays) is ~570B smaller in level_load's fixed-region code.
 // ext_raw layout: [0]=n_gd [1]=n_sw, then n_gd x 10B gem-door records, then
 // n_sw x 8B switch records (see MMC5_OFF_EXT). Counts are 0 for levels without.
-#define EXT_RAW_MAX (2 + MMC5_MAX_GD * 10 + MMC5_MAX_SW * 8)
+#define EXT_RAW_MAX (2 + MMC5_MAX_GD * 18 + MMC5_MAX_SW * 8)
 extern unsigned char ext_raw[EXT_RAW_MAX];
 extern unsigned char gd_n, sw_n;
 extern unsigned char *sw_base;   // level_load sets = ext_raw+2+gd_n*10 (switch recs)
-#define GD_REC(i) (ext_raw + 2 + (unsigned int)(i) * 10u)
+#define GD_REC(i) (ext_raw + 2 + (unsigned int)(i) * 18u)
 #define gd_hx(i)     GD_REC(i)[0]
 #define gd_hy(i)     GD_REC(i)[1]
 #define gd_color(i)  GD_REC(i)[2]
@@ -285,10 +302,6 @@ unsigned char mmc5_mt_flags(unsigned char mx, unsigned char my);
 #define MT_FLAGS(mx, my) mmc5_mt_flags((unsigned char)(mx), (unsigned char)(my))
 
 // batch metatile-INDEX fetches (u16) for the seam renderer
-void map_col_read16(unsigned char mx, unsigned char my, unsigned char n,
-                    unsigned int *dst);
-void map_row_read16(unsigned char mx, unsigned char my, unsigned char n,
-                    unsigned int *dst);
 // Seam decoder (hot path): maps the single MT bank ONCE, then decodes nmt
 // metatile indices mi[] into buf[] (tile-ids) + ex[] (ExRAM bytes), two
 // subtiles per cell (field k0 then k1, interleaved). k0/k1 = top/bottom for a

@@ -248,7 +248,18 @@ static unsigned int pl_cov_mask;
 static unsigned char pl_cov_hide;
 static const unsigned char *cov_prev; // last frame walked (record state owner)
 static unsigned char cov_dirty;       // some record still carries 0x20
-__attribute__((noinline, section(".prg_rom_6.text"))) static void
+// caches: cover_scan reruns only when Keen's cell / the override list change;
+// cover_pri_b rewrites records only when its inputs change. Run
+// unconditionally the two cost ~8% of a busy frame.
+static unsigned char cov_cell_x = 0xFF, cov_cell_y = 0xFF, cov_ovgen = 0xFF;
+static unsigned char cov_in_fx = 0xFF, cov_in_fy, cov_in_fr, cov_in_fc;
+static unsigned int cov_in_mask;
+// bit for image cell (r,c): (r<<2)|c indexed; a variable u16 shift lowers to
+// a runtime loop (__ashlhi3) on the 6502, so both paths use tables/increments
+__attribute__((section(".prg_rom_27")))
+static const unsigned int cov_bit_b6[12] = {1, 2, 4, 0, 16, 32, 64, 0,
+                                            256, 512, 1024, 0};
+__attribute__((noinline, section(".prg_rom_27.text"))) static void
 cover_pri_b(void) {
   const unsigned char *cur;
   unsigned char fx, fy, all = 1, any = 0;
@@ -262,6 +273,7 @@ cover_pri_b(void) {
         q += 4;
       }
       cov_dirty = 0;
+      cov_in_fx = 0xFF;
     }
     return;
   }
@@ -273,6 +285,7 @@ cover_pri_b(void) {
       q += 4;
     }
     cov_dirty = 0;
+    cov_in_fx = 0xFF;
   }
   cov_prev = cur;
   q = (unsigned char *)cur;
@@ -284,15 +297,25 @@ cover_pri_b(void) {
       }
     cov_dirty = 0;
     pl_cov_hide = 0;
+    cov_in_fx = 0xFF;
     return;
   }
   fx = (unsigned char)((pl_x - KEEN_CLIP_XL) >> 4) & 15u;
   fy = (unsigned char)(pl_y >> 4) & 15u;
+  // identical inputs since the last walk: records already correct
+  if (fx == cov_in_fx && fy == cov_in_fy && pl_cov_mask == cov_in_mask &&
+      anim_frame == cov_in_fr && pl_face == cov_in_fc)
+    return;
+  cov_in_fx = fx;
+  cov_in_fy = fy;
+  cov_in_mask = pl_cov_mask;
+  cov_in_fr = anim_frame;
+  cov_in_fc = pl_face;
   while (*q != 128) {
     // sample the 8x16 sprite's center: +4px x, +8px y into the sprite
     unsigned char r = (unsigned char)((fy + q[1] + 8u) >> 4);
     unsigned char c = (unsigned char)((fx + q[0] + 4u) >> 4);
-    if (pl_cov_mask & (1u << ((r << 2) | c))) {
+    if (pl_cov_mask & cov_bit_b6[(r << 2) | c]) {
       q[3] |= 0x20;
       any = 1;
     } else {
@@ -306,19 +329,31 @@ cover_pri_b(void) {
 }
 
 // 3x3 cell scan of Keen's image window -> pl_cov_mask (bit r<<2|c). Runs in
-// the fixed region every tic: MT_FLAGS maps the level blob at $8000.
+// the fixed region (MT_FLAGS maps the level blob at $8000), but only when
+// Keen crosses into a new cell or the override list changes (ov_n proxies
+// door/switch cell swaps) — the mask is a pure function of those inputs.
 static void cover_scan(void) {
   unsigned char bc = (unsigned char)((pl_x - KEEN_CLIP_XL) >> 8);
   unsigned char br = (unsigned char)(pl_y >> 8);
-  unsigned char r, c;
-  unsigned int m = 0;
-  for (r = 0; r < 3; ++r) {
+  unsigned char r;
+  unsigned int m = 0, bit = 1;
+  if (bc == cov_cell_x && br == cov_cell_y && ov_n == cov_ovgen)
+    return;
+  cov_cell_x = bc;
+  cov_cell_y = br;
+  cov_ovgen = ov_n;
+  for (r = 0; r < 3; ++r, bit <<= 2) {
     unsigned char my = (unsigned char)(br + r);
     if (my >= g_h)
       break;
-    for (c = 0; c < 3; ++c)
-      if (flags_at((unsigned char)(bc + c), my) & 0x80)
-        m |= 1u << ((r << 2) | c);
+    if (flags_at(bc, my) & 0x80)
+      m |= bit;
+    bit <<= 1;
+    if (flags_at((unsigned char)(bc + 1), my) & 0x80)
+      m |= bit;
+    bit <<= 1;
+    if (flags_at((unsigned char)(bc + 2), my) & 0x80)
+      m |= bit;
   }
   pl_cov_mask = m;
 }
@@ -413,6 +448,9 @@ player_init_b(void) {
   pole_cd = 0;
   pl_cov_mask = 0;
   pl_cov_hide = 0;
+  cov_cell_x = 0xFF; // cover caches: recompute on the first tic
+  cov_ovgen = 0xFF;
+  cov_in_fx = 0xFF;
   pl_gem_hit = pl_switch_hit = pl_door = 0;
   look_dir = 0;
   look_timer = 0;
@@ -422,8 +460,9 @@ player_init_b(void) {
   plat_ridden = 0;
   for (s = 0; s < MAX_SHOTS; ++s)
     shot_state[s] = 0; // live stunner shots die with the reload
-  // gems are taken away on death AND after every level
-  pl_keys = 0;
+  // pl_keys is cleared by main.c's level-entry AND death-reload paths (DOS
+  // behavior: dying reloads the level fresh -- items respawn, gems reset,
+  // doors re-close -- so gem state always belongs to the level session).
 }
 
 void player_init(void) {
@@ -558,9 +597,11 @@ static void tic(unsigned char pad) {
     // covered-terrain sprite priority (bank 6): the walk path's banked call
     // below is unreachable from this early return, so apply it here too
     cover_scan();
-    set_prg_bank(6, 0x80);
-    cover_pri_b();
-    set_prg_bank(lvl_bank[g_level], 0x80);
+    if (pl_cov_mask || cov_dirty) {
+      set_prg_bank(27, 0x80);
+      cover_pri_b();
+      set_prg_bank(lvl_bank[g_level], 0x80);
+    }
     jump_held_prev = jump_held;
     pogo_held_prev = pogo_held;
     up_prev = pad & PAD_UP;
@@ -715,8 +756,12 @@ static void tic(unsigned char pad) {
   cover_scan();
   set_prg_bank(6, 0x80);
   look_tic_b(pad);
-  cover_pri_b();
   set_prg_bank(lvl_bank[g_level], 0x80);
+  if (pl_cov_mask || cov_dirty) {
+    set_prg_bank(27, 0x80);
+    cover_pri_b();
+    set_prg_bank(lvl_bank[g_level], 0x80);
+  }
 
   // --- X move + collision ---
   if (pl_vx) {

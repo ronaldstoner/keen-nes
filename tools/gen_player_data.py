@@ -592,10 +592,10 @@ def main():
     for o in order:
         lines.append(f"  {{ ms_{o}_R, ms_{o}_L }},\n")
     lines.append("};\n")
-    # Bank-6 mirror of ms_frames: the covered-terrain sprite-priority walker
-    # (player.c cover_pri_b) runs from bank 6 and needs the active frame's
-    # ms_wram record pointer without mapping draw bank 26.
-    lines.append('__attribute__((used, section(".prg_rom_6")))'
+    # Bank-27 mirror of ms_frames: the covered-terrain sprite-priority walker
+    # (player.c cover_pri_b) runs from cold bank 27 and needs the active
+    # frame's ms_wram record pointer without mapping draw bank 26.
+    lines.append('__attribute__((used, section(".prg_rom_27")))'
                  " const unsigned char *const ms_frames_b6[][2] = {\n")
     for o in order:
         lines.append(f"  {{ ms_{o}_R, ms_{o}_L }},\n")

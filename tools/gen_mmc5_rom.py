@@ -35,10 +35,10 @@ BANK = 8192            # 8KB PRG bank
 CHRBANK = 4096         # 4KB CHR bank
 FIXED_BANKS = 3        # last 24KB = fixed engine region (banked-8 layout)
 # 8KB PRG banks owned by other generators (shared bank map): HUD(6),
-# music(7,9,10,11), sfx(8), title(12). Level blobs must skip them and each
-# level's banks must be CONTIGUOUS (the reader computes spill banks as
-# base_bank + (off>>13)).
-RESERVED_BANKS = frozenset((6, 7, 8, 9, 10, 11, 12, 26))
+# music(7,9,10,11), sfx(8), title(12), draw(26), seam-patch/cover(27).
+# Level blobs must skip them and each level's banks must be CONTIGUOUS (the
+# reader computes spill banks as base_bank + (off>>13)).
+RESERVED_BANKS = frozenset((6, 7, 8, 9, 10, 11, 12, 26, 27))
 
 # MT SoA field order (level_fmt.h): tl tr bl br  tl_ex tr_ex bl_ex br_ex  top flags
 EX_FIELDS = (4, 5, 6, 7)   # the four ExRAM-byte fields to rewrite
@@ -335,6 +335,61 @@ def alloc_banks(part_counts):
     return firsts, prg_kb
 
 
+def append_planes(blob):
+    """Pre-flatten the level into per-8x8 planes: one byte-per-cell TILES
+    plane and one EXRAM plane, row-major with pitch = w*2 bytes, packed so no
+    plane row straddles an 8KB PRG bank (rows_per_bank = 8192//pitch, bank
+    tails padded). A per-row directory (3 bytes: bank-from-base, $8000-window
+    address u16) is appended in the u16-addressable region before the planes;
+    the seam renderer block-copies strip bytes from the planes instead of
+    walking the u16 map and decoding metatile records (~5-6k CPU cycles per
+    scrolled strip). Directory entries are 4 bytes: bank-from-base, $8000-
+    window address u16, rows-left-in-bank (column strips split into two
+    counted segment copies with no per-cell bank compare).
+    Header: 88-89 = u16 row-directory offset, 90 = tiles
+    plane size in banks (the EXRAM plane starts that many banks later at the
+    same in-bank offsets). Must run AFTER realign_mt (offsets final) and
+    rewrite_exram_banks (record ExRAM bytes already absolute)."""
+    import struct as _s
+    w, h = blob[2], blob[3]
+    off_map = _s.unpack_from("<I", blob, 20)[0]
+    off_mt = _s.unpack_from("<I", blob, 24)[0]
+    w2, h2 = w * 2, h * 2
+    pitch = w2
+    rpb = BANK // pitch                      # rows per 8KB bank
+    nb = (h2 + rpb - 1) // rpb               # banks per plane
+    assert len(blob) + h2 * 4 < 65536, "row directory outside u16 range"
+    # planes, packed per bank
+    tiles = bytearray(nb * BANK)
+    exp = bytearray(nb * BANK)
+    rowdir = bytearray()
+    dir_off = len(blob)
+    plane_bank = (len(blob) + h2 * 3 + BANK - 1) // BANK
+    for ty in range(h2):
+        my = ty >> 1
+        qbase = (ty & 1) << 1
+        bank_i, slot = divmod(ty, rpb)
+        row = bank_i * BANK + slot * pitch
+        rowdir += bytes((plane_bank + bank_i,))
+        rowdir += _s.pack("<H", 0x8000 + slot * pitch)
+        rowdir += bytes((rpb - slot,))  # rows left in this bank incl. this one
+        mrow = off_map + my * w * 2
+        for mx in range(w):
+            mi = blob[mrow + mx * 2] | (blob[mrow + mx * 2 + 1] << 8)
+            rec = off_mt + mi * 8
+            d = row + mx * 2
+            tiles[d] = blob[rec + qbase]
+            tiles[d + 1] = blob[rec + qbase + 1]
+            exp[d] = blob[rec + 4 + qbase]
+            exp[d + 1] = blob[rec + 4 + qbase + 1]
+    _s.pack_into("<H", blob, 88, dir_off)
+    blob[90] = nb
+    blob.extend(rowdir)
+    blob.extend(bytes(plane_bank * BANK - len(blob)))
+    blob.extend(tiles)
+    blob.extend(exp)
+
+
 def main():
     # ---- gather, assign CHR offsets, rewrite ExRAM banks ----
     chr_all = bytearray()
@@ -346,6 +401,7 @@ def main():
         nbanks = len(chrom) // CHRBANK
         realign_mt(blob)                 # MT -> its own 8KB bank (seam fast path)
         rewrite_exram_banks(blob, chr_off)
+        append_planes(blob)              # flat per-8x8 planes (seam block-copy)
         per_level.append(dict(n=n, blob=blob, chr_off=chr_off, nbanks=nbanks))
         chr_all += chrom
         chr_off += nbanks

@@ -40,7 +40,9 @@ assert EP in (4, 5, 6), "MMC5 emit supports keen4/5/6 (Galaxy engine)"
 # --- blob header (see src/level_fmt.h "MMC5 EXRAM LEVEL FORMAT") ---
 MAGIC = 0x4D           # 'M'
 VERSION = 2
-HDR = 88               # fixed header size; section offsets are u32 from blob
+HDR = 92               # fixed header size; section offsets are u32 from blob
+                        # (bytes 88-90 = pre-flattened plane directory, written
+                        # by gen_mmc5_rom.append_planes; 91 pad)
                        # start (data spans multiple 8KB PRG banks).
 
 # metatile table is STRUCT-OF-ARRAYS: 10 parallel u8 arrays of N entries in
@@ -163,9 +165,30 @@ def build_cells(n, ts):
             while dy + dh < h and fg[(dy + dh) * w + dx] == dfg:
                 dh += 1
             placed_key = addkey((bg[i], f + ti0.fg_anim_offset(f), 0))  # +18
-            open_key = addkey((bg[dy * w + dx],
-                               dfg + ti0.fg_anim_offset(dfg), 0))       # +1
-            gemholders.append((x, y, m - 7, placed_key, dx, dy, dh, open_key))
+
+            # The DOS door-open ticks door-column tiles +1 per animation
+            # step from the info target DOWNWARD for height+2 rows (the door
+            # run plus the two ground/base tiles below it), until each cell's
+            # chain terminal (anim offset 0) = its fully-open art. The NES
+            # skips the animation and swaps straight to the terminals. Cells
+            # without a chain (fixed rail deco) stay as-is, like DOS.
+            def chain_end(t):
+                for _ in range(8):
+                    step = ti0.fg_anim_offset(t)
+                    if step <= 0:
+                        break
+                    t += step
+                return t
+            nrows = min(dh + 2, h - dy)
+            assert nrows <= 5, f"gem door taller than record space ({nrows})"
+            open_keys = []
+            for k in range(nrows):
+                cy = dy + k
+                cfg = fg[cy * w + dx]
+                open_keys.append(addkey(
+                    (bg[cy * w + dx], chain_end(cfg) if cfg else 0, 0)))
+            gemholders.append((x, y, m - 7, placed_key, dx, dy, nrows,
+                               open_keys))
         elif m in (5, 6, 15):                # SWITCHPLATON/OFF/BRIDGE
             tv = info[i]
             tx, ty = tv >> 8, tv & 0xFF
@@ -717,10 +740,12 @@ def emit_level(n, ts):
     # gem-door + switch metatiles (baked so they exist in the MT table; the
     # runtime swaps map cells to these on gem-place / switch-press)
     gd_recs = []
-    for (hx, hy, color, pk, dx, dy, dh, ok) in d["gemholders"]:
+    for (hx, hy, color, pk, dx, dy0, nrows, oks) in d["gemholders"]:
         gd_recs.append((hx, hy, color,
                         metatile_for(pk, span_of_col(hx, cuts)),
-                        dx, dy, dh, metatile_for(ok, span_of_col(dx, cuts))))
+                        dx, dy0, nrows,
+                        [metatile_for(ok, span_of_col(dx, cuts))
+                         for ok in oks]))
     sw_recs = []
     for (sx, sy, ofk, onk, tx, ty) in d["switches"]:
         sw_recs.append((sx, sy, metatile_for(ofk, span_of_col(sx, cuts)),
@@ -874,9 +899,12 @@ def emit_level(n, ts):
         ext_off = HDR + len(body)
         body.append(len(gd_recs))
         body.append(len(sw_recs))
-        for (hx, hy, color, placed, dx, dy, dh, openm) in gd_recs:
-            body.extend(struct.pack("<BBBHBBBH",
-                                    hx, hy, color, placed, dx, dy, dh, openm))
+        for (hx, hy, color, placed, dx, dy0, nrows, openms) in gd_recs:
+            body.extend(struct.pack("<BBBHBBB",
+                                    hx, hy, color, placed, dx, dy0, nrows))
+            for k in range(5):  # fixed 18B record: 5 per-row open metatiles
+                body.extend(struct.pack(
+                    "<H", openms[k] if k < nrows else 0))
         for (sx, sy, offm, onm, tx, ty) in sw_recs:
             body.extend(struct.pack("<BBHHBB", sx, sy, offm, onm, tx, ty))
 

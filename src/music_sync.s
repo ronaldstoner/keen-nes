@@ -1,7 +1,9 @@
-; Run music from elapsed 60 Hz NMI frames, not simulation-loop iterations.
-; Catch-up is capped at three ticks to prevent an unbounded burst after a
-; debugger stop or long forced-blank transition. The tick count lives on the
-; hardware stack across kmusic_tick because C may clobber all scratch registers.
+; Run music from elapsed 60 Hz NMI frames, not simulation-loop iterations,
+; so the tempo stays DECOUPLED from gameplay slowdown: a dropped frame costs
+; an extra tick here, never a slower song. Catch-up is capped at three ticks
+; to prevent an unbounded burst after a debugger stop or long forced-blank
+; transition. The tick count lives on the hardware stack across kmusic_tick
+; because C may clobber all scratch registers.
 .globl kmusic_sync
 .globl kmusic_tick
 .globl music_frame_seen

@@ -272,9 +272,15 @@ typedef unsigned char map_t;
 
 // shared seam scratch: static so the hot loops use absolute,x addressing
 // instead of soft-stack pointers (column draw was ~8k cycles with locals)
-static unsigned char seam_buf[35]; // 17 metatiles x 2 tiles + slack
+static unsigned char seam_buf[35]; // 34-cell strip tiles + slack
 static unsigned char seam_ex[35];  // parallel per-8x8 ExRAM bytes
-static unsigned int seam_mt[19];   // u16 metatile indices for a seam strip
+// strip patch hits (override/picked cells collected in bank 26, applied from
+// the fixed region with the MT record bank mapped). d = strip position,
+// q = record subtile field, m = replacement metatile index.
+#define PATCH_MAX 24
+static unsigned char patch_d[PATCH_MAX], patch_q[PATCH_MAX];
+static unsigned int patch_m[PATCH_MAX];
+static unsigned char patch_n;
 
 // ---------------------------------------------------------------------------
 // VERTICAL-SCROLL OVERSCAN SEAM (30-row nametable + vertical mirroring). A
@@ -352,65 +358,118 @@ static void item_sweep(void) {
 // strip's x-range (~8 u8 iterations), then walk while x <= x1 testing the
 // picked bit — bounded work per strip regardless of how much was picked.
 // MMC5: item records are 5 bytes (empty_mt is u16) and the strip holds u16
-// metatile indices (seam_mt). Overlays each picked item's empty-cell metatile
+// metatile indices. Overlays each picked item's empty-cell metatile
 // index onto the fetched strip.
-GEM_BANK26 static void apply_picked_b(unsigned char is_row, unsigned char fixed,
-                                      unsigned char base, unsigned char nmt) {
-  unsigned int lo = 0, hi = g_nitems;
-  unsigned char x0, x1;
-  const unsigned char *it;
-  if (is_row) {
-    x0 = base;
-    x1 = (unsigned char)(base + nmt - 1);
-  } else {
-    x0 = fixed;
-    x1 = fixed;
-  }
-  if (x1 < picked_min_x || x0 > picked_max_x)
-    return;
-  if (is_row) {
-    if (fixed < picked_min_y || fixed > picked_max_y)
-      return;
-  } else {
-    unsigned char y1 = (unsigned char)(base + nmt - 1);
-    if (y1 < picked_min_y || base > picked_max_y)
-      return;
-  }
-  while (lo < hi) { // lower bound: first item with x >= x0
-    unsigned int mid = lo + ((hi - lo) >> 1);
-    if (g_items[mid * 5u] < x0)
-      lo = mid + 1;
-    else
-      hi = mid;
-  }
-  it = g_items + ((unsigned int)lo * 5u);
-  for (; lo < g_nitems; ++lo, it += 5) {
-    unsigned char d;
-    if (it[0] > x1)
-      break; // x-sorted: past the strip
-    if (!PICKED(lo))
+// Collect strip patch hits: gem-door/switch override cells (ov list) and
+// picked-item empty cells. Pure WRAM (ov arrays + item table + picked bitmap)
+// -> bank 26; the fixed-region applier below fetches the record bytes.
+// Row strips: fixed = 8px row ty, base8 = first 8px column, n = cells.
+// Col strips: fixed = 8px col tx, base8 = first 8px row.
+__attribute__((noinline, section(".prg_rom_27.text"))) static void
+patch_collect_b(unsigned char is_row, unsigned int fixed,
+                                       unsigned int base8, unsigned char n) {
+  unsigned char mfix = (unsigned char)(fixed >> 1);
+  unsigned char q0 = is_row ? (unsigned char)((fixed & 1u) << 1)
+                            : (unsigned char)(fixed & 1u);
+  unsigned char qstep = is_row ? 1 : 2; // row: tl->tr; col: tl->bl
+  unsigned char m0 = (unsigned char)(base8 >> 1);
+  unsigned char m1 = (unsigned char)((base8 + n - 1) >> 1);
+  unsigned char i;
+  patch_n = 0;
+  for (i = 0; i < ov_n; ++i) {
+    unsigned char omx = ov_mx[i], omy = ov_my[i];
+    unsigned char cell = is_row ? omx : omy;
+    int d;
+    if ((is_row ? omy : omx) != mfix || cell < m0 || cell > m1)
       continue;
-    if (is_row) {
-      if (it[1] != fixed)
-        continue;
-      d = (unsigned char)(it[0] - base);
-    } else {
-      d = (unsigned char)(it[1] - base);
+    d = (int)((unsigned int)cell << 1) - (int)base8;
+    if (d >= 0 && d < n && patch_n < PATCH_MAX) {
+      patch_d[patch_n] = (unsigned char)d;
+      patch_q[patch_n] = q0;
+      patch_m[patch_n++] = ov_mt[i];
     }
-    if (d < nmt)
-      seam_mt[d] = (unsigned int)it[3] | ((unsigned int)it[4] << 8);
+    ++d;
+    if (d >= 0 && d < n && patch_n < PATCH_MAX) {
+      patch_d[patch_n] = (unsigned char)d;
+      patch_q[patch_n] = (unsigned char)(q0 + qstep);
+      patch_m[patch_n++] = ov_mt[i];
+    }
+  }
+  if (!picked_any)
+    return;
+  { // picked items: x-sorted table, bbox + lower-bound as before
+    unsigned int lo = 0, hi = g_nitems;
+    unsigned char x0 = is_row ? m0 : mfix, x1 = is_row ? m1 : mfix;
+    const unsigned char *it;
+    if (x1 < picked_min_x || x0 > picked_max_x)
+      return;
+    if (is_row) {
+      if (mfix < picked_min_y || mfix > picked_max_y)
+        return;
+    } else {
+      if (m1 < picked_min_y || m0 > picked_max_y)
+        return;
+    }
+    while (lo < hi) {
+      unsigned int mid = lo + ((hi - lo) >> 1);
+      if (g_items[mid * 5u] < x0)
+        lo = mid + 1;
+      else
+        hi = mid;
+    }
+    it = g_items + ((unsigned int)lo * 5u);
+    for (; lo < g_nitems; ++lo, it += 5) {
+      unsigned char cell;
+      int d;
+      unsigned int m;
+      if (it[0] > x1)
+        break;
+      if (!PICKED(lo))
+        continue;
+      if (is_row) {
+        if (it[1] != mfix)
+          continue;
+        cell = it[0];
+      } else {
+        if (it[1] < m0 || it[1] > m1)
+          continue;
+        cell = it[1];
+      }
+      m = (unsigned int)it[3] | ((unsigned int)it[4] << 8);
+      d = (int)((unsigned int)cell << 1) - (int)base8;
+      if (d >= 0 && d < n && patch_n < PATCH_MAX) {
+        patch_d[patch_n] = (unsigned char)d;
+        patch_q[patch_n] = q0;
+        patch_m[patch_n++] = m;
+      }
+      ++d;
+      if (d >= 0 && d < n && patch_n < PATCH_MAX) {
+        patch_d[patch_n] = (unsigned char)d;
+        patch_q[patch_n] = (unsigned char)(q0 + qstep);
+        patch_m[patch_n++] = m;
+      }
+    }
   }
 }
 
-// This is seam-only work over WRAM (entity arena + picked bitmap + seam_mt),
-// so keep its sizeable u16 search body out of the critically-full fixed ROM.
-static void apply_picked(unsigned char is_row, unsigned char fixed,
-                         unsigned char base, unsigned char nmt) {
-  if (!picked_any)
+// Apply collected patches with the MT record bank mapped (fixed region: the
+// record window is the $8000 bank). Leaves $5114 on mt_bank like the old
+// decode path did.
+static void patch_apply(unsigned char is_row, unsigned int fixed,
+                        unsigned int base8, unsigned char n) {
+  unsigned char i;
+  if (!ov_n && !picked_any)
     return;
-  set_prg_bank(26, 0x80);
-  apply_picked_b(is_row, fixed, base, nmt);
-  set_prg_bank(lvl_bank[g_level], 0x80);
+  set_prg_bank(27, 0x80);
+  patch_collect_b(is_row, fixed, base8, n);
+  *(volatile unsigned char *)0x5114 = mt_bank;
+  for (i = 0; i < patch_n; ++i) {
+    const unsigned char *rec =
+        (const unsigned char *)(0x8000u + ((patch_m[i] << 3) & 0x1FFFu));
+    unsigned char d = patch_d[i], q = patch_q[i];
+    seam_buf[d] = rec[q];
+    seam_ex[d] = rec[q + 4];
+  }
 }
 
 // Pickup-only bookkeeping is cold and pure WRAM, so keep its comparisons in
@@ -487,7 +546,7 @@ static unsigned int nt_addr(unsigned int tx, unsigned int ty) {
 // preserved. WRAM-only -> bank 6. The seam-row cell is already SEAM_BLANK_EX in
 // seam_ex (draw_column sets it), so the blank is carried through.
 MAIN_COLD static void col_ex_stage_b(unsigned char col, unsigned int ty) {
-  unsigned char exi = (unsigned char)(ty & 1);
+  unsigned char exi = 0; // strips are 0-based (flat planes)
   unsigned char ntr = ntrow_of(ty);
   unsigned char i;
   anim_del(0, col);
@@ -509,7 +568,7 @@ static void col_ex_stage(unsigned char col, unsigned int ty) {
     set_prg_bank(lvl_bank[g_level], 0x80);
   } else {
     // >1 restore column this frame (rare catch-up): slow per-cell path.
-    unsigned char exi = (unsigned char)(ty & 1);
+    unsigned char exi = 0; // strips are 0-based (flat planes)
     unsigned char ntr = ntrow_of(ty);
     unsigned char i;
     anim_del(0, col);
@@ -520,46 +579,72 @@ static void col_ex_stage(unsigned char col, unsigned int ty) {
     }
   }
 }
-// MMC5 draw one full tile column (world 8px-tile x = tx): emit nametable
-// tile-ids through the VRAM buffer AND stage the parallel per-8x8 ExRAM
-// bytes at the matching coarse offsets. Left/right subtile fields of the
-// metatile are selected by tx parity. tx is u16 (wide maps >255 columns).
+// MMC5 draw one full tile column (world 8px-tile x = tx): block-copy 30
+// plane bytes per plane (stride = pitch, bank bump on $A000 wrap), patch
+// override/picked cells, emit nametable tile-ids through the VRAM buffer and
+// stage the parallel ExRAM bytes. tx is u16 (wide maps >255 columns).
 static void draw_column(unsigned int tx) {
-  unsigned int ty = cam_y >> 3;
-  unsigned char my0 = (unsigned char)(ty >> 1);
-  unsigned char mx = (unsigned char)(tx >> 1);
-  unsigned char odd = (unsigned char)(tx & 1u);
-  unsigned char kt = odd ? 1 : 0;   // tr : tl  (top subtile field)
-  unsigned char kb = odd ? 3 : 2;   // br : bl  (bottom subtile field)
+  unsigned int ty0 = cam_y >> 3;
   unsigned char col = (unsigned char)(tx & 31u);
-  unsigned char nmt, i;
+  unsigned char count = 30, seg, i;
+  unsigned char bank;
+  const unsigned char *pp0;
+  const unsigned char *pp;
   const unsigned char *src;
   unsigned char remaining;
   unsigned int tyy;
   if (tx >= (unsigned int)g_w * 2u)
     return;
-  nmt = 16;
-  if ((unsigned char)(my0 + nmt) > g_h)
-    nmt = g_h - my0;
-  map_col_read16(mx, my0, nmt, seam_mt);  // map_cell readers apply gem-door overrides
-  apply_picked(0, mx, my0, nmt);
-  // decode top/bottom subtiles for all nmt cells with the MT bank mapped once
-  mmc5_seam_decode(kt, kb, nmt, seam_mt, seam_buf, seam_ex);
-  for (i = (unsigned char)(nmt << 1); i < 32; ++i) {
+  if (ty0 + 30u > (unsigned int)g_h * 2u)
+    count = (unsigned char)((unsigned int)g_h * 2u - ty0);
+  pp0 = (const unsigned char *)(pln_locate(ty0) + tx);
+  seg = pln_rows_left; // rows in the first bank (two counted segment loops)
+  if (seg > count)
+    seg = count;
+  bank = pln_cur_bank;
+  *(volatile unsigned char *)0x5114 = bank;
+  pp = pp0;
+  for (i = 0; i < seg; ++i) {
+    seam_buf[i] = *pp;
+    pp += pln_pitch;
+  }
+  if (seg < count) {
+    *(volatile unsigned char *)0x5114 = (unsigned char)(bank + 1);
+    pp = (const unsigned char *)(0x8000u + tx);
+    for (i = seg; i < count; ++i) {
+      seam_buf[i] = *pp;
+      pp += pln_pitch;
+    }
+  }
+  *(volatile unsigned char *)0x5114 = (unsigned char)(bank + pln_ex_delta);
+  pp = pp0;
+  for (i = 0; i < seg; ++i) {
+    seam_ex[i] = *pp;
+    pp += pln_pitch;
+  }
+  if (seg < count) {
+    *(volatile unsigned char *)0x5114 =
+        (unsigned char)(bank + pln_ex_delta + 1);
+    pp = (const unsigned char *)(0x8000u + tx);
+    for (i = seg; i < count; ++i) {
+      seam_ex[i] = *pp;
+      pp += pln_pitch;
+    }
+  }
+  for (i = count; i < 30; ++i) {
     seam_buf[i] = 0;
     seam_ex[i] = 0;
   }
-  // The seam row (top window row, ntrow_of(ty) == ntrow_of(cam_y>>3)) is the
-  // FIRST cell of every column strip and is always in the top/bottom overscan.
-  // Point its ExRAM at the all-zero bank so it renders BLACK (any tile through a
-  // zero CHR bank = all color 0 = backdrop $0F); the nametable tile stays real,
-  // so restoring the cell (when the seam moves) needs only its ExRAM back. This
-  // keeps horizontal scroll from leaving the aliased wrap row visible.
-  seam_ex[ty & 1] = SEAM_BLANK_EX;
-  // emit 30 tiles from strip offset (ty & 1), split at the NT row wrap
-  src = seam_buf + (ty & 1);
+  patch_apply(0, tx, ty0, count);
+  // The seam row (top window row) is the FIRST cell of every column strip and
+  // is always in the top/bottom overscan: point its ExRAM at the all-zero
+  // bank so it renders BLACK; the nametable tile stays real, so restoring the
+  // cell (when the seam moves) needs only its ExRAM back.
+  seam_ex[0] = SEAM_BLANK_EX;
+  // emit 30 tiles, split at the NT row wrap
+  src = seam_buf;
   remaining = 30;
-  tyy = ty;
+  tyy = ty0;
   while (remaining) {
     unsigned char run = 30 - ntrow_of(tyy);
     if (run > remaining)
@@ -571,32 +656,34 @@ static void draw_column(unsigned int tx) {
   }
   // stage the 30 cells' ExRAM via the stride-32 fast fill (bank 6). col fixed,
   // ntrow wraps at 30; anim_del + anim_add handled in col_ex_stage.
-  col_ex_stage(col, ty);
+  col_ex_stage(col, ty0);
 }
 
 
-// MMC5 build the row strip for world row ty at the camera's left seam
-// column: fills seam_buf (nametable tile-ids) AND seam_ex (per-8x8 ExRAM
-// bytes) for 17 metatiles (34 subtiles). Left/right subtile fields chosen
-// by ty parity. Shared by draw_row and draw_screen_full.
+// MMC5 build the row strip for world 8px row ty at the camera's left seam
+// column: block-copy 34 plane bytes per plane (rows are contiguous and never
+// straddle a bank) and patch override/picked cells. Strips are 0-based:
+// seam_buf[0] is world column cam_x>>3 (the old metatile-parity offset is
+// pre-flattened into the planes). Shared by draw_row and draw_screen_full.
 static void build_row_strip(unsigned int ty) {
-  unsigned char mx0 = (unsigned char)((cam_x >> 3) >> 1);
-  unsigned char my = (unsigned char)(ty >> 1);
-  unsigned char lowbit = (unsigned char)(ty & 1);
-  unsigned char kl = lowbit ? 2 : 0;   // bl : tl  (left subtile field)
-  unsigned char kr = lowbit ? 3 : 1;   // br : tr  (right subtile field)
-  unsigned char nmt, i;
-  nmt = 17;
-  if ((unsigned char)(mx0 + nmt) > g_w)
-    nmt = g_w - mx0;
-  map_row_read16(mx0, my, nmt, seam_mt);  // map_cell readers apply gem-door overrides
-  apply_picked(1, my, mx0, nmt);
-  // decode left/right subtiles for all nmt cells with the MT bank mapped once
-  mmc5_seam_decode(kl, kr, nmt, seam_mt, seam_buf, seam_ex);
-  for (i = (unsigned char)(nmt << 1); i < 34; ++i) {
+  unsigned int tx0 = cam_x >> 3;
+  unsigned char count = 34, i;
+  unsigned int a = pln_locate(ty) + tx0;
+  const unsigned char *pp = (const unsigned char *)a;
+  if (tx0 + 34u > (unsigned int)g_w * 2u)
+    count = (unsigned char)((unsigned int)g_w * 2u - tx0);
+  *(volatile unsigned char *)0x5114 = pln_cur_bank;
+  for (i = 0; i < count; ++i)
+    seam_buf[i] = pp[i];
+  *(volatile unsigned char *)0x5114 =
+      (unsigned char)(pln_cur_bank + pln_ex_delta);
+  for (i = 0; i < count; ++i)
+    seam_ex[i] = pp[i];
+  for (i = count; i < 34; ++i) {
     seam_buf[i] = 0;
     seam_ex[i] = 0;
   }
+  patch_apply(1, ty, tx0, count);
 }
 
 // draw one full tile row: nametable via the VRAM buffer + stage ExRAM
@@ -626,7 +713,7 @@ static void blacken_seam_row(void) {
 MAIN_COLD static void row_ex_stage_b(unsigned char ntr, unsigned char tx) {
   unsigned int base = (unsigned int)ntr * 32u;
   volatile unsigned char *rex = row_ex + ((unsigned int)row_n << 5);
-  unsigned char exi = (unsigned char)(tx & 1);
+  unsigned char exi = 0; // strips are 0-based (flat planes)
   unsigned char txx = tx;
   unsigned char i;
   anim_del(1, ntr);
@@ -660,7 +747,7 @@ __attribute__((noinline)) static void draw_row(unsigned int ty) {
   if (ty >= (unsigned int)g_h * 2u)
     return;
   build_row_strip(ty);             // real tiles + ExRAM
-  src = seam_buf + (tx & 1u);
+  src = seam_buf;
   remaining = 33;
   txx = tx;
   while (remaining) {
@@ -693,8 +780,8 @@ static void draw_screen_full(void) {
     if (ntr == seam_ntr)            // aliased overscan seam row -> ExRAM black
       for (k = 0; k < 34; ++k)
         seam_ex[k] = SEAM_BLANK_EX;  // (real tiles stay in seam_buf)
-    src = seam_buf + (left & 1u);
-    sex = seam_ex + (left & 1u);
+    src = seam_buf;
+    sex = seam_ex;
     k = 0;
     for (tx = left; tx < left + 33u && tx < (unsigned int)g_w * 2u; ++tx, ++k) {
       unsigned int off = (unsigned int)ntr * 32u + (tx & 31u);
@@ -824,16 +911,19 @@ static void door_state_reset(void) {
 // added (0 = already done); the caller cell_write's [ov_n-added .. ov_n).
 GEM_BANK26 static unsigned char gem_place(unsigned char gi) {
   const unsigned char *r = GD_REC(gi);
-  unsigned char k, dh = r[7];
-  unsigned int openm = r[8] | ((unsigned int)r[9] << 8);
+  unsigned char k, nrows = r[7];
   if (gd_done_bm & bit8[gi])
     return 0;
   gd_done_bm |= bit8[gi];
   pl_keys &= (unsigned char)~(1u << r[2]);           // consume the matching gem
   ov_add(r[0], r[1], r[3] | ((unsigned int)r[4] << 8));  // holder -> placed art
-  for (k = 0; k < dh; ++k)
-    ov_add(r[5], (unsigned char)(r[6] + k), openm);      // open the door column
-  return (unsigned char)(1 + dh);
+  // open the door column: per-row FULLY-OPEN metatiles (caps included),
+  // record bytes 8+ hold open_mt[5]
+  for (k = 0; k < nrows; ++k)
+    ov_add(r[5], (unsigned char)(r[6] + k),
+           (unsigned int)r[8 + (k << 1)] |
+               ((unsigned int)r[9 + (k << 1)] << 8));
+  return (unsigned char)(1 + nrows);
 }
 
 // flip switch si: toggle its art + the target B-block marker (info ^= 0x1F). The
@@ -1319,6 +1409,7 @@ int main(void) {
         picked_bm[i] = 0;
       picked_any = 0;
       item_lo = 0;
+      pl_keys = 0; // gems are per level (survive death; see player_init)
     }
 
 #if HAS_WORLD_MAP
@@ -1382,6 +1473,7 @@ int main(void) {
           picked_bm[i] = 0;
         picked_any = 0;
         item_lo = 0;
+        pl_keys = 0; // gems are per level (survive death; see player_init)
         cam_bounds();
         player_init();
         actors_init(); // combat only
@@ -1443,6 +1535,7 @@ int main(void) {
           picked_bm[i] = 0;
         picked_any = 0;
         item_lo = 0;
+        pl_keys = 0; // gems are per level (survive death; see player_init)
         cam_bounds();
         player_init();
         map_player_place(); // no actors_init on map
@@ -1468,6 +1561,7 @@ int main(void) {
           picked_bm[i] = 0;
         picked_any = 0;
         item_lo = 0;
+        pl_keys = 0; // gems are per level (survive death; see player_init)
         cam_bounds();
         actors_init();
         pl_dead = 2;
@@ -1487,6 +1581,23 @@ int main(void) {
             if (pl_lives == 0)
               break;
             --pl_lives;
+            // DOS-faithful death: reload the LEVEL fresh — items respawn,
+            // gems reset, doors re-close, actors respawn, Keen back at the
+            // level spawn, song restarts. (pl_dead == 2 is the linear-mode
+            // next-level path, which already ran its own load above.)
+            {
+              unsigned char i;
+              level_load(g_level);
+              door_state_reset();
+              kmusic_play(lvl_game_no[g_level]);
+              for (i = 0; i < sizeof(picked_bm); ++i)
+                picked_bm[i] = 0;
+              picked_any = 0;
+              item_lo = 0;
+              pl_keys = 0;
+              cam_bounds();
+            }
+            actors_init();
           }
           player_init();
           pl_dead = 0;

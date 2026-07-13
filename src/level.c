@@ -74,6 +74,10 @@ static unsigned int rows_off[96];
 // {4 tile ids, 4 ExRAM attrs}; top[N],flags[N] follow. gen_mmc5_rom aligns the
 // whole 10*N table to one bank. One m<<3 locates a render record.
 unsigned char mt_bank;
+// flat per-8x8 planes (header bytes 88-90; see level_fmt.h)
+unsigned char pln_ex_delta, pln_cur_bank, pln_rows_left;
+unsigned int pln_pitch;
+static unsigned int pln_dir_off; // per-row directory (4B: bank, addr, left)
 // Entity tables for the demo slice (max ~666B on Slug Village). Full-game L4
 // needs ~1.5KB; keep room for growth without eating the soft stack. Soft stack
 // grows down from $7FFF into PRG-RAM — if BSS fills to the top, nested C frames
@@ -146,50 +150,9 @@ unsigned char mmc5_mt_flags(unsigned char mx, unsigned char my) {
   return mt_flags_p[m];
 }
 
-// batch metatile-index fetches for the seam renderer (u16 dst). BATCH bank
-// semantics: the $8000 window ($5114) is reprogrammed only when the cell's
-// bank actually CHANGES, not per byte. off_map is even
-// and the bank size (8192) is even, so a u16 cell never straddles a bank
-// boundary (its low byte can't land on offset 0x1FFF) — both bytes are always
-// in the currently-mapped bank, so one bank set per bank-run suffices. A
-// column strip crosses at most ~2 banks (16 rows x w*2 apart); a row strip is
-// contiguous and almost always one bank. Was 2 $5114 writes PER CELL.
-void map_col_read16(unsigned char mx, unsigned char my, unsigned char n,
-                    unsigned int *dst) {
-  unsigned int base = (unsigned int)mx << 1;   // rows_off[] already has off_map
-  unsigned char lastbank = 0xFF;
-  while (n--) {
-    unsigned int off = base + rows_off[my];
-    unsigned char bk = (unsigned char)(base_bank + (unsigned char)(off >> 13));
-    const unsigned char *p = (const unsigned char *)(0x8000u + (off & 0x1FFFu));
-    unsigned int v;
-    if (bk != lastbank) {
-      M5_PRG0 = (unsigned char)(0x80 | bk);
-      lastbank = bk;
-    }
-    v = (unsigned int)p[0] | ((unsigned int)p[1] << 8);
-    *dst++ = ov_n ? ov_apply(v, mx, my) : v;   // opened door / swapped cells
-    ++my;
-  }
-}
-void map_row_read16(unsigned char mx, unsigned char my, unsigned char n,
-                    unsigned int *dst) {
-  unsigned int off = rows_off[my] + ((unsigned int)mx << 1); // rows_off has off_map
-  unsigned char lastbank = 0xFF;
-  while (n--) {
-    unsigned char bk = (unsigned char)(base_bank + (unsigned char)(off >> 13));
-    const unsigned char *p = (const unsigned char *)(0x8000u + (off & 0x1FFFu));
-    unsigned int v;
-    if (bk != lastbank) {
-      M5_PRG0 = (unsigned char)(0x80 | bk);
-      lastbank = bk;
-    }
-    v = (unsigned int)p[0] | ((unsigned int)p[1] << 8);
-    *dst++ = ov_n ? ov_apply(v, mx, my) : v;
-    ++mx;
-    off += 2;
-  }
-}
+// (The batch strip readers map_col_read16/map_row_read16 were retired by the
+// flat-plane seam renderer: strips block-copy pre-flattened bytes instead of
+// walking the u16 map. map_cell/MT_* remain the collision + single-cell path.)
 
 // Seam decoder: one bank map and one m*8 address per metatile, followed by
 // fixed-offset loads — the 6502 no longer performs four independent u16 indexes.
@@ -235,6 +198,10 @@ void level_load(unsigned char n) {
   anim_speed = B[MMC5_OFF_ANIMSPD];
   anim_base = B[MMC5_OFF_ANIMBASE];
   anim_nbanks = B[MMC5_OFF_ANIMNBK];
+  // flat plane directory: the seam renderer block-copies from these banks
+  pln_dir_off = rd16(MMC5_OFF_PLANE_DIR);
+  pln_ex_delta = B[MMC5_OFF_PLANE_NBANKS];
+  pln_pitch = (unsigned int)g_w << 1;
 
   fb = off_mt + (N << 3);                // collision arrays follow 8B records
   // window pointers into mt_bank (off_mt is bank-aligned -> fb & 0x1FFF = 8N)
@@ -283,7 +250,7 @@ void level_load(unsigned char n) {
       sw_n = rd8(e + 1);
       for (j = 0; j < EXT_RAW_MAX; ++j)
         ext_raw[j] = rd8(e + j);
-      sw_base = ext_raw + 2 + (unsigned int)gd_n * 10u;
+      sw_base = ext_raw + 2 + (unsigned int)gd_n * 18u;
     }
   }
 
@@ -298,6 +265,18 @@ void level_load(unsigned char n) {
   // CHR: sprites on set A; bg per-cell via ExRAM. $5130 in level_chr_refresh_b.
   level_chr_refresh();
   g_region = 0;
+}
+
+// flat-plane row lookup: 4-byte directory entry -> $8000-window address;
+// pln_cur_bank gets the row's TILES bank (EX plane = +pln_ex_delta banks at
+// the same address) and pln_rows_left how many rows (incl. this one) remain
+// in that bank -- column strips split into two counted segment copies.
+// Fixed region: rd8 maps the blob at $8000.
+unsigned int pln_locate(unsigned int ty) {
+  unsigned int e = pln_dir_off + (ty << 2);
+  pln_cur_bank = (unsigned char)(0x80 | (base_bank + rd8(e)));
+  pln_rows_left = rd8(e + 3);
+  return rd16(e + 1);
 }
 
 // single palette set for keen4 (SPANBOUNDS empty): nothing to switch.
