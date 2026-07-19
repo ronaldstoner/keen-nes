@@ -22,7 +22,18 @@ BYTE(                                         /* 9: PRG/CHR size high nibbles */
   ((__prg_rom_size / 16) >> 8 & 0xf) << 0 |
   ((__chr_rom_size / 8)  >> 8 & 0xf) << 4
 )
-BYTE(0)   /* 10: PRG-(NV)RAM shift counts (none for the proof) */
+/* 10: PRG-(NV)RAM shift counts.  Low nibble = VOLATILE PRG-RAM, size =
+ * 64 << shift, so 7 -> 8192 bytes = the 8KB at $6000-$7FFF that holds the C
+ * runtime (.data/.bss/.noinit + soft stack; see mmc5.ld and the $5113 = 0
+ * bank select in reset_keen.s).  High nibble = NVRAM, 0: no battery.
+ * This MUST be non-zero.  The file is flagged iNES 2.0 (flags7 bit3), and
+ * under 2.0 the PRG-RAM size comes from THIS byte, not the iNES 1.0 byte 8.
+ * Leaving it 0 declares "no PRG-RAM": a strict emulator (Mesen) then maps
+ * nothing at $6000-$7FFF, so every .bss read returns OPEN BUS (the address
+ * high byte) and every write is discarded.  That reads as garbage in any
+ * value loaded from RAM -- e.g. g_pal came back as sixteen $68 bytes at
+ * $68B0, painting the whole background one palette. */
+BYTE(7)
 BYTE(0)   /* 11: CHR-(NV)RAM shift counts (CHR-ROM only)       */
 BYTE(0)   /* 12: timing = NTSC */
 BYTE(0)   /* 13: vs/extended console */

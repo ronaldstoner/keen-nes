@@ -33,6 +33,7 @@ ROOT = Path(__file__).resolve().parent.parent
 LEVELS = [int(a) for a in sys.argv[1:]] or [1, 2, 3, 4]
 BANK = 8192            # 8KB PRG bank
 CHRBANK = 4096         # 4KB CHR bank
+DIR_ENT = 4            # plane row-directory entry: bank u8, addr u16, rows-left u8
 FIXED_BANKS = 3        # last 24KB = fixed engine region (banked-8 layout)
 # 8KB PRG banks owned by other generators (shared bank map): HUD(6),
 # music(7,9,10,11), sfx(8), title(12), draw(26), seam-patch/cover(27).
@@ -339,13 +340,13 @@ def append_planes(blob):
     """Pre-flatten the level into per-8x8 planes: one byte-per-cell TILES
     plane and one EXRAM plane, row-major with pitch = w*2 bytes, packed so no
     plane row straddles an 8KB PRG bank (rows_per_bank = 8192//pitch, bank
-    tails padded). A per-row directory (3 bytes: bank-from-base, $8000-window
-    address u16) is appended in the u16-addressable region before the planes;
-    the seam renderer block-copies strip bytes from the planes instead of
-    walking the u16 map and decoding metatile records (~5-6k CPU cycles per
-    scrolled strip). Directory entries are 4 bytes: bank-from-base, $8000-
-    window address u16, rows-left-in-bank (column strips split into two
-    counted segment copies with no per-cell bank compare).
+    tails padded). A per-row directory is appended in the u16-addressable
+    region before the planes; the seam renderer block-copies strip bytes from
+    the planes instead of walking the u16 map and decoding metatile records
+    (~5-6k CPU cycles per scrolled strip). Directory entries are DIR_ENT (4)
+    bytes: bank-from-base, $8000-window address u16, rows-left-in-bank (column
+    strips split into two counted segment copies with no per-cell bank
+    compare).
     Header: 88-89 = u16 row-directory offset, 90 = tiles
     plane size in banks (the EXRAM plane starts that many banks later at the
     same in-bank offsets). Must run AFTER realign_mt (offsets final) and
@@ -358,13 +359,14 @@ def append_planes(blob):
     pitch = w2
     rpb = BANK // pitch                      # rows per 8KB bank
     nb = (h2 + rpb - 1) // rpb               # banks per plane
-    assert len(blob) + h2 * 4 < 65536, "row directory outside u16 range"
+    assert len(blob) + h2 * DIR_ENT < 65536, "row directory outside u16 range"
+    assert rpb <= 255, f"rows_per_bank {rpb} > 255 (w={w} too narrow)"
     # planes, packed per bank
     tiles = bytearray(nb * BANK)
     exp = bytearray(nb * BANK)
     rowdir = bytearray()
     dir_off = len(blob)
-    plane_bank = (len(blob) + h2 * 3 + BANK - 1) // BANK
+    plane_bank = (len(blob) + h2 * DIR_ENT + BANK - 1) // BANK
     for ty in range(h2):
         my = ty >> 1
         qbase = (ty & 1) << 1
